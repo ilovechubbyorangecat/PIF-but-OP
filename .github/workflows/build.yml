@@ -10,7 +10,9 @@ jobs:
       matrix:
         config:
         - name: Windows
-          os: windows-latest
+          # Geode uses the runner's clang++. Pair LLVM 20 with VS 2022's STL;
+          # the VS 2026 STL on windows-latest requires Clang 22 or newer.
+          os: windows-2022
         - name: Android32
           os: ubuntu-latest
           target: Android32
