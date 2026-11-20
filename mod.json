@@ -10,7 +10,7 @@
 	"id": "basu.input-buffer",
 	"name": "Click Before Frames",
 	"developer": "BASU",
-	"description": "Trajectory-based input buffer: delays early clicks/releases by up to 8+ frames, with orb, pad and portal-aware prediction. github.com/raresdalas1009/-predictive-input-buffer",
+	"description": "Trajectory-based input buffer: delays early clicks/releases by up to 16 frames, with orb, pad and portal-aware prediction. github.com/raresdalas1009/-predictive-input-buffer",
 	"settings": {
 		"custom-ticks": {
 			"type": "int",
@@ -439,12 +439,6 @@
 			"type": "bool",
 			"name": "Show Online Players",
 			"description": "Shows how many Click Before Frames players are online in the window's footer. To count you, every 90 seconds the game sends the Click Before Frames server an anonymous random id, your device type and the mod's version. No name, account, level or gameplay. Turn it off and nothing is sent.",
-			"default": true
-		},
-		"check-updates": {
-			"type": "bool",
-			"name": "Check for updates",
-			"description": "On game start, check GitHub for a newer version and show a popup on the main menu if there is one. 'Update now' downloads it from the latest GitHub release and installs it; restart the game to use it.",
 			"default": true
 		},
 		"menu-theme": {
