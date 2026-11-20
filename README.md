@@ -5,12 +5,16 @@
 
 Practice use only; do not use for verified or leaderboard runs.
 
+Select **16f** on the Stage page for a buffer window of up to 16 frames at 60 FPS (64 physics ticks at 240 TPS). Low Latency still caps presets at one frame, and ship uses its own delay setting. For independent limits, choose **Custom → Open Tuning** and set each mode in half-frame steps up to 16 frames.
+
+This mod no longer checks for or installs updates in-game. Install new versions manually.
+
 ## v3.0
 - **Autoplay** (for showcases, test mode: nothing is saved as progress and AUTOPLAY stays on screen): plans a route up to 10 s ahead while it plays, a pathfinder for wave and ship, and it learns from its deaths.
 - **Macros**: autoplay plays GD Replay (GDR) macros: your own in the Macros Folder, or one it downloads from [Hyperbolus](https://hyperbolus.net) (used with its owner's permission, every macro credited). It lines the macro up by itself, keeps you on its path with the bot's position records, plans the parts a macro dies in, and plays 2-player levels with each player's clicks.
 - **Global brain**: a run autoplay finishes is shared, and every game's autoplay can play the runs others finished.
-- **New window**: animations, an autoplay panel, an Account tab, and updates from the Click Before Frames site.
-- **Online** (each can be turned off in the settings): an anonymous id with your device type and version every 90 s (the online counter), autoplay's finished runs (the level and the button presses), and linking the game to your Discord on the site. Autoplay and updates need the game linked to Discord.
+- **New window**: animations, an autoplay panel, and an Account tab.
+- **Online** (each can be turned off in the settings): an anonymous id with your device type and version every 90 s (the online counter), autoplay's finished runs (the level and the button presses), and linking the game to your Discord on the site. Autoplay needs the game linked to Discord.
 
 ## v2.4 options (mod settings)
 - Wave auto-release (practice only, off by default): lets go for you when holding would crash within the window and letting go survives.
