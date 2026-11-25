@@ -5735,8 +5735,8 @@ namespace online {
         return static_cast<double>(std::max<int64_t>(240, Mod::get()->getSettingValue<int64_t>("tps")));
     }
 
-    // v3.1.1: the steps a second the game really runs (the TPS setting doesn't change it on 2.2091:
-    // Grief's 360 TPS macro was played at 240 by time and died at once)
+// v3.1.1: the steps a second the game really runs (the TPS setting doesn't change it on 2.2091:
+// Grief's 360 TPS macro was played at 240 by time and died at once)
     double physicsTps() {
         if (tpsOverride > 0) {
             return tpsOverride;
