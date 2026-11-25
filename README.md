@@ -3,6 +3,8 @@
 ## Keys
 6 cycle stage | 7 menu | F8 copy the console log | F9 open/close the in-game console | F10 path view | F11 forget this level's memory
 
+Requires Geode 6.0.0 or newer (the first Geode release with stable Geometry Dash 2.2091 support).
+
 Practice use only; do not use for verified or leaderboard runs.
 
 Select **16f** on the Stage page for a buffer window of up to 16 frames at 60 FPS (64 physics ticks at 240 TPS). Low Latency still caps presets at one frame, and ship uses its own delay setting. For independent limits, choose **Custom → Open Tuning** and set each mode in half-frame steps up to 16 frames.
@@ -104,3 +106,4 @@ This mod no longer checks for or installs updates in-game. Install new versions 
 - v3.0.1: the autoplay trail is hidden by default (setting: Show Autoplay Trail), and the AUTOPLAY label can be small and see-through in the bottom corner for showcases (setting: Autoplay Label).
 - v3.1.0: the global brain's run comes first (over any macro you have; then your Macros folder, then Hyperbolus), the log says why there's no run for you (another TPS or another version of the level), and a Forget Macro button in the autoplay panel.
 - v3.2.0: a level the global brain has a run of always plays it (even over a picked macro), brain runs play clean from 0 to 100 with their positions and at their own TPS; xdBot macros play exactly like xdBot; macros from Hyperbolus, MacroDash and Astral, and Choose Macro to pick one yourself; runs a macro finished go to the brain with their positions; a new TV-static menu with eyes (the site's look, VT323 font, starts at half size); a redesigned website with a CBF demonlist. Supports Geometry Dash version 2.2091.
+- v3.2.1: built against Geode 6 (the first stable SDK for 2.2091): updated PlayLayer::init and the renamed PlayerObject state fields, switched to the new save-directory / file / time APIs, and moved off-screen ghost collision filling out of the now-unhookable PlayerObject::postCollision. Autoplay's danger marks are capped and broad-phase checked, and hidden ghosts are released when a level is replaced without quitting.

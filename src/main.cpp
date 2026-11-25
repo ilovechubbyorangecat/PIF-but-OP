@@ -30,6 +30,7 @@
 #include <Geode/modify/EndLevelLayer.hpp>
 #include <Geode/ui/GeodeUI.hpp>
 #include <Geode/ui/Popup.hpp>
+#include <asp/fs/std.hpp>
 #include <map>
 #include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/RingObject.hpp>
@@ -67,6 +68,9 @@ namespace {
     constexpr float TICK = 0.25f;
     constexpr size_t PANEL_LINES = 8;
     constexpr int SPIDER_LAND = 12;  // v2.15: ticks on a surface after a spider input = safe
+    // Marks the ghost avoids are checked on every simulated tick. Keep the list
+    // bounded so a long autoplay session can't grow it (and its save file) forever.
+    constexpr size_t MAX_AUTO_DANGERS = 64;
 
     constexpr uint64_t typeBit(GameObjectType type) {
         return 1ull << static_cast<int>(type);
@@ -103,6 +107,23 @@ namespace {
     bool hasType(uint64_t mask, GameObject* object) {
         auto type = static_cast<unsigned>(object->m_objectType);
         return type < 64 && ((mask >> type) & 1);
+    }
+
+    // Geode 6 (the SDK that supports GD 2.2091) returns asp::fs::Path from
+    // Mod::getSaveDir(). Convert it once here so every file in this mod keeps
+    // using the same std::filesystem paths as before.
+    std::filesystem::path saveDir() {
+        return Mod::get()->getSaveDir().toStdPath().unwrapOr(std::filesystem::path());
+    }
+
+    std::filesystem::path configDir() {
+        return Mod::get()->getConfigDir().toStdPath().unwrapOr(std::filesystem::path());
+    }
+
+    // Geode 6 file helpers take asp paths; keep std::filesystem for the rest of
+    // the mod and convert only where those helpers are called.
+    asp::fs::Path aspPath(std::filesystem::path const& path) {
+        return asp::fs::Path::fromStdPath(path);
     }
 
     float speedPortalValue(int id) {
@@ -347,14 +368,22 @@ namespace {
         bool yBand = false;
         float yBandCenter = 0.f;
         float yBandHalf = 0.f;
-        bool postCollisionSeen = false;  // test 33: GD called postCollision inside this collision check
+        bool postCollisionSeen = false;  // test 33: off-screen objects were injected inside this collision check
         long long offscreenAdded = 0;    // objects the index added (shown at a death)
-        long long offscreenFallback = 0; // ...of those, added after the check (postCollision never came)
+        long long offscreenFallback = 0; // ...of those, added after the check (the in-check injection never ran)
         int pathHoldUntil = 0;       // v2.65: live path waits while a click's path is on screen
 
         std::unordered_set<GameObject*> simUsed;
         std::vector<ObjSnapshot> snapshots;
     } buf;
+
+    // Keep the most recent spots; the oldest mark is the least useful one.
+    void rememberDanger(CCRect r) {
+        if (buf.autoDangers.size() >= MAX_AUTO_DANGERS) {
+            buf.autoDangers.erase(buf.autoDangers.begin());
+        }
+        buf.autoDangers.push_back(r);
+    }
 
     std::string stageText();
     void forgetMoveTriggers();
@@ -934,8 +963,8 @@ namespace {
 
         bool copied = geode::utils::clipboard::write(text);
         std::error_code ec;
-        std::filesystem::create_directories(mod->getSaveDir(), ec);
-        std::ofstream(mod->getSaveDir() / "console-export.txt", std::ios::trunc) << text;
+        std::filesystem::create_directories(saveDir(), ec);
+        std::ofstream(saveDir() / "console-export.txt", std::ios::trunc) << text;
         say("console {} ({} lines) + saved to console-export.txt", copied ? "copied to clipboard" : "NOT copied", exportLines.size());
     }
 
@@ -1095,7 +1124,7 @@ namespace {
         ghost->m_wasJumpBuffered = real->m_wasJumpBuffered;
         ghost->m_stateJumpBuffered = real->m_stateJumpBuffered;
         ghost->m_stateRingJump = real->m_stateRingJump;
-        ghost->m_stateRingJump2 = real->m_stateRingJump2;
+        ghost->m_statePreJump = real->m_statePreJump;
         ghost->m_wasRobotJump = real->m_wasRobotJump;
         ghost->m_touchedRing = real->m_touchedRing;
         ghost->m_touchedPad = real->m_touchedPad;
@@ -1118,9 +1147,9 @@ namespace {
         ghost->m_isGoingLeft = real->m_isGoingLeft;
         ghost->m_isSideways = real->m_isSideways;
         ghost->m_reverseSync = real->m_reverseSync;
-        ghost->m_reverseRelated = real->m_reverseRelated;
+        ghost->m_reverseCooldown = real->m_reverseCooldown;
         ghost->m_maybeReverseSpeed = real->m_maybeReverseSpeed;
-        ghost->m_maybeReverseAcceleration = real->m_maybeReverseAcceleration;
+        ghost->m_reverseSyncStep = real->m_reverseSyncStep;
         ghost->m_speedMultiplier = real->m_speedMultiplier;
         ghost->m_gravity = real->m_gravity;
         ghost->m_yStart = real->m_yStart;
@@ -1137,35 +1166,35 @@ namespace {
         ghost->m_fallSpeed = real->m_fallSpeed;
         ghost->m_yVelocityBeforeSlope = real->m_yVelocityBeforeSlope;
         ghost->m_yVelocityRelated = real->m_yVelocityRelated;
-        ghost->m_yVelocityRelated3 = real->m_yVelocityRelated3;
+        ghost->m_diagonalYStep = real->m_diagonalYStep;
         ghost->m_groundYVelocity = real->m_groundYVelocity;
         ghost->m_accelerationOrSpeed = real->m_accelerationOrSpeed;
         ghost->m_isAccelerating = real->m_isAccelerating;
-        ghost->m_maybeIsFalling = real->m_maybeIsFalling;
-        ghost->m_isOnGround2 = real->m_isOnGround2;
-        ghost->m_isOnGround3 = real->m_isOnGround3;
-        ghost->m_isOnGround4 = real->m_isOnGround4;
+        ghost->m_hasStartedFalling = real->m_hasStartedFalling;
+        ghost->m_touchingGround = real->m_touchingGround;
+        ghost->m_landedSinceFlip = real->m_landedSinceFlip;
+        ghost->m_wasTouchingGround = real->m_wasTouchingGround;
         ghost->m_stateOnGround = real->m_stateOnGround;
         ghost->m_lastLandTime = real->m_lastLandTime;
         ghost->m_lastJumpTime = real->m_lastJumpTime;
         ghost->m_lastFlipTime = real->m_lastFlipTime;
         ghost->m_lastSpiderFlipTime = real->m_lastSpiderFlipTime;
         ghost->m_lastGroundedPos = real->m_lastGroundedPos;
-        ghost->m_blackOrbRelated = real->m_blackOrbRelated;
-        ghost->m_padRingRelated = real->m_padRingRelated;
-        ghost->m_ringJumpRelated = real->m_ringJumpRelated;
+        ghost->m_lastSlopeSnapOffset = real->m_lastSlopeSnapOffset;
+        ghost->m_ringJumpedSincePress = real->m_ringJumpedSincePress;
+        ghost->m_usedRingThisStep = real->m_usedRingThisStep;
 
         // slopes
         ghost->m_isOnSlope = real->m_isOnSlope;
         ghost->m_wasOnSlope = real->m_wasOnSlope;
         ghost->m_slopeVelocity = real->m_slopeVelocity;
-        ghost->m_maybeUpsideDownSlope = real->m_maybeUpsideDownSlope;
+        ghost->m_slopeResnapped = real->m_slopeResnapped;
         ghost->m_currentSlope = real->m_currentSlope;
         ghost->m_currentSlope2 = real->m_currentSlope2;
         ghost->m_currentPotentialSlope = real->m_currentPotentialSlope;
         ghost->m_isCollidingWithSlope = real->m_isCollidingWithSlope;
         ghost->m_collidingWithSlopeId = real->m_collidingWithSlopeId;
-        ghost->m_slopeFlipGravityRelated = real->m_slopeFlipGravityRelated;
+        ghost->m_slopeIsDownhill = real->m_slopeIsDownhill;
         ghost->m_slopeAngle = real->m_slopeAngle;
         ghost->m_slopeAngleRadians = real->m_slopeAngleRadians;
         ghost->m_slopeRotation = real->m_slopeRotation;
@@ -1206,13 +1235,14 @@ namespace {
         ghost->m_affectedByForces = real->m_affectedByForces;
         ghost->m_stateBoostX = real->m_stateBoostX;
         ghost->m_stateBoostY = real->m_stateBoostY;
-        ghost->m_stateNoStickX = real->m_stateNoStickX;
-        ghost->m_stateNoStickY = real->m_stateNoStickY;
+        // 2.2091 folded the old m_stateNoStickX/Y bytes into this word; copying
+        // it keeps the whole 4-byte state block the ghost needs.
+        ghost->m_unusedFloatA80 = real->m_unusedFloatA80;
         ghost->m_stateHitHead = real->m_stateHitHead;
         ghost->m_stateFlipGravity = real->m_stateFlipGravity;
         ghost->m_stateNoAutoJump = real->m_stateNoAutoJump;
         ghost->m_stateScale = real->m_stateScale;
-        ghost->m_maybeStateForce2 = real->m_maybeStateForce2;
+        ghost->m_stateNoWallPush = real->m_stateNoWallPush;
     }
 
     // Your recent input timings, so predictions model what you actually do instead of
@@ -2375,7 +2405,7 @@ namespace {
     std::filesystem::path memoryFile() {
         // v2.37: slices keyed by the real position. v2.75: _v3, a fresh start after the
         // prediction fixes of v2.61-v2.74 (old files learned from the buggy versions)
-        return Mod::get()->getSaveDir() / "memory" / (memoryKey + "_v3.txt");
+        return saveDir() / "memory" / (memoryKey + "_v3.txt");
     }
 
     size_t memorySpots() {
@@ -2649,7 +2679,7 @@ namespace {
 
     // v3.0 test 27: the level index's objects near a hidden player that GD didn't give it this step
     void injectOffscreen(PlayLayer* layer, PlayerObject* ghost, float dt) {
-        static gd::vector<GameObject*> extra;
+        static std::vector<GameObject*> extra;
         extra.clear();
         auto pos = ghost->getPosition();
         int b = static_cast<int>(std::floor(pos.x / 64.f));
@@ -2709,7 +2739,7 @@ namespace {
             }
         }
         if (buf.offscreenFill && !buf.postCollisionSeen && !buf.objIndex.empty() && !buf.ghostDied) {
-            // test 33: GD didn't call postCollision in this check: the far objects go in after it
+            // test 33: the in-check injection never ran: the far objects go in after it
             auto before = buf.offscreenAdded;
             injectOffscreen(layer, ghost, dt);
             buf.offscreenFallback += buf.offscreenAdded - before;
@@ -2717,6 +2747,11 @@ namespace {
         if (buf.simulating && !buf.ghostDied && !buf.autoDangers.empty()) {
             auto r = ghost->getObjectRect();
             for (auto const& d : buf.autoDangers) {
+                // Cheap broad phase: most marks are somewhere else in the level,
+                // so don't pay for a full rect test on every ghost tick.
+                if (r.getMaxX() < d.origin.x || d.getMaxX() < r.origin.x) {
+                    continue;
+                }
                 if (r.intersectsRect(d)) {
                     buf.ghostDied = true;
                     break;
@@ -4078,7 +4113,7 @@ namespace {
     std::string lastBench;        // last result, for the stats popup
 
     std::filesystem::path benchFile() {
-        return Mod::get()->getSaveDir() / "bench" / (memoryKey + ".txt");
+        return saveDir() / "bench" / (memoryKey + ".txt");
     }
 
     size_t benchSavedTicks() {
@@ -4245,8 +4280,8 @@ namespace {
         say("run check: {} | max error {:.1f}u{} | {:.0f} ms", lastBench, maxErr,
             std::abs(r.dt - buf.tickLength) > 1e-4f ? " | recorded at another frame rate" : "", ms);
         std::error_code ec;
-        std::filesystem::create_directories(Mod::get()->getSaveDir(), ec);
-        std::ofstream(Mod::get()->getSaveDir() / "run-check-results.txt", std::ios::app)
+        std::filesystem::create_directories(saveDir(), ec);
+        std::ofstream(saveDir() / "run-check-results.txt", std::ios::app)
             << Mod::get()->getVersion().toVString() << ' ' << memoryKey << ": " << lastBench << '\n';
     }
 
@@ -4968,7 +5003,7 @@ namespace online {
             while (true) {
                 if (Mod::get()->getSettingValue<bool>("online-players")) {
                     auto res = web::WebRequest()
-                        .timeout(std::chrono::seconds(10))
+                        .timeout(asp::Duration::fromSecs(10))
                         .userAgent("ClickBeforeFrames")
                         .header("Content-Type", "application/json")
                         .bodyString(body)
@@ -5027,7 +5062,7 @@ namespace online {
             }
             std::string url = fmt::format("{}/api/account?id={}", online::URL, online::id());
             std::thread([url] {
-                auto res = web::WebRequest().timeout(std::chrono::seconds(15)).userAgent("ClickBeforeFrames").getSync(url);
+                auto res = web::WebRequest().timeout(asp::Duration::fromSecs(15)).userAgent("ClickBeforeFrames").getSync(url);
                 Stats st;
                 if (res.ok()) {
                     if (auto j = res.json(); j.isOk()) {
@@ -5071,7 +5106,7 @@ namespace online {
             dirty = true;
             std::string body = fmt::format(R"({{"id":"{}"}})", online::id());
             std::thread([body] {
-                auto res = web::WebRequest().timeout(std::chrono::seconds(15)).userAgent("ClickBeforeFrames").header("Content-Type", "application/json")
+                auto res = web::WebRequest().timeout(asp::Duration::fromSecs(15)).userAgent("ClickBeforeFrames").header("Content-Type", "application/json")
                     .bodyString(body).postSync(std::string(online::URL) + "/api/link/start");
                 std::string c, url;
                 if (res.ok()) {
@@ -5096,7 +5131,7 @@ namespace online {
                 });
                 for (int i = 0; i < 200; ++i) {
                     std::this_thread::sleep_for(std::chrono::seconds(3));
-                    auto p = web::WebRequest().timeout(std::chrono::seconds(10)).userAgent("ClickBeforeFrames")
+                    auto p = web::WebRequest().timeout(asp::Duration::fromSecs(10)).userAgent("ClickBeforeFrames")
                         .getSync(fmt::format("{}/api/link/poll?code={}", online::URL, c));
                     if (!p.ok()) {
                         continue;
@@ -5307,7 +5342,7 @@ namespace online {
     }
 
     std::filesystem::path autoplayFile() {
-        return Mod::get()->getSaveDir() / "autoplay" / (autoplay.saveKey + ".txt");
+        return saveDir() / "autoplay" / (autoplay.saveKey + ".txt");
     }
 
     void autoplayKey(PlayLayer* layer) {
@@ -5483,7 +5518,7 @@ namespace online {
     };
 
     std::filesystem::path macroDir() {
-        return Mod::get()->getConfigDir() / "macros";
+        return configDir() / "macros";
     }
 
     struct Macro {
@@ -6038,7 +6073,7 @@ namespace online {
 
     // the page's data: <script data-page="app" type="application/json">{...}</script>
     std::optional<matjson::Value> hyperbolusPage(std::string const& url) {
-        auto res = web::WebRequest().timeout(std::chrono::seconds(20)).userAgent("ClickBeforeFrames").getSync(url);
+        auto res = web::WebRequest().timeout(asp::Duration::fromSecs(20)).userAgent("ClickBeforeFrames").getSync(url);
         if (!res.ok()) {
             return std::nullopt;
         }
@@ -6082,7 +6117,7 @@ namespace online {
             for (int page = 1; page <= std::min(last, 8); ++page) {
                 // test 71: Hyperbolus's own API (the level page's data before)
                 std::optional<matjson::Value> data;
-                auto api = web::WebRequest().timeout(std::chrono::seconds(20)).userAgent("ClickBeforeFrames")
+                auto api = web::WebRequest().timeout(asp::Duration::fromSecs(20)).userAgent("ClickBeforeFrames")
                     .getSync(fmt::format("https://hyperbolus.net/api/macros?level_id={}&format=gdr&page={}", levelId, page));
                 if (api.ok()) {
                     if (auto j = api.json(); j.isOk()) {
@@ -6143,7 +6178,7 @@ namespace online {
                 };
                 std::string want = norm(levelName);
                 std::string base = "https://raw.githubusercontent.com/downupstudio/macrodash/main/";
-                auto idx = web::WebRequest().timeout(std::chrono::seconds(15)).userAgent("ClickBeforeFrames").getSync(base + "macros-data.js");
+                auto idx = web::WebRequest().timeout(asp::Duration::fromSecs(15)).userAgent("ClickBeforeFrames").getSync(base + "macros-data.js");
                 if (idx.ok() && !want.empty()) {
                     std::string js = idx.string().unwrapOr("");
                     auto field = [](std::string const& chunk, std::string const& key) -> std::string {
@@ -6182,7 +6217,7 @@ namespace online {
                         q += fmt::format("%{:02X}", c);
                     }
                 }
-                auto res = web::WebRequest().timeout(std::chrono::seconds(15)).userAgent("ClickBeforeFrames")
+                auto res = web::WebRequest().timeout(asp::Duration::fromSecs(15)).userAgent("ClickBeforeFrames")
                     .getSync(fmt::format("https://astral-api.gwddos.workers.dev/api/macros?page=1&limit=50&search={}", q));
                 if (res.ok()) {
                     if (auto j = res.json(); j.isOk() && j.unwrap()["macros"].isArray()) {
@@ -6237,7 +6272,7 @@ namespace online {
                     ++skippedBad;
                     continue;
                 }
-                auto file = web::WebRequest().timeout(std::chrono::seconds(60)).userAgent("ClickBeforeFrames").followRedirects(true).getSync(o.url);
+                auto file = web::WebRequest().timeout(asp::Duration::fromSecs(60)).userAgent("ClickBeforeFrames").followRedirects(true).getSync(o.url);
                 if (!file.ok()) {
                     continue;
                 }
@@ -6293,7 +6328,7 @@ namespace online {
                 std::filesystem::create_directories(dir, ec);
                 std::filesystem::remove(dir / fmt::format("{}.gdr", levelId), ec);
                 std::filesystem::remove(dir / fmt::format("{}.gdr.json", levelId), ec);
-                (void)file::writeBinarySafe(path, ByteSpan(best.data));
+                (void)file::writeBinarySafe(aspPath(path), ByteSpan(best.data));
                 if (best.m.author.empty()) {
                     best.m.author = best.o.author;
                 }
@@ -6345,7 +6380,7 @@ namespace online {
     std::vector<MacroChoice> listMacroChoices(int levelId, std::string const& levelName, std::string const& print, int myTps) {
         std::vector<MacroChoice> out;
         auto get = [](std::string const& url) {
-            return web::WebRequest().timeout(std::chrono::seconds(15)).userAgent("ClickBeforeFrames").followRedirects(true).getSync(url);
+            return web::WebRequest().timeout(asp::Duration::fromSecs(15)).userAgent("ClickBeforeFrames").followRedirects(true).getSync(url);
         };
         // the global brain
         if (!std::string_view(online::URL).empty() && !print.empty()) {
@@ -6487,7 +6522,7 @@ namespace online {
         std::filesystem::path dir = macroDir();
         OnlineMacro o = c.o;
         std::thread([levelId, o, dir] {
-            auto file = web::WebRequest().timeout(std::chrono::seconds(60)).userAgent("ClickBeforeFrames").followRedirects(true).getSync(o.url);
+            auto file = web::WebRequest().timeout(asp::Duration::fromSecs(60)).userAgent("ClickBeforeFrames").followRedirects(true).getSync(o.url);
             if (!file.ok()) {
                 queueInMainThread([o] { say("autoplay: couldn't download {} from {}", o.file, o.source); });
                 return;
@@ -6513,7 +6548,7 @@ namespace online {
             std::filesystem::create_directories(dir, ec);
             std::filesystem::remove(dir / fmt::format("{}.gdr", levelId), ec);
             std::filesystem::remove(dir / fmt::format("{}.gdr.json", levelId), ec);
-            (void)file::writeBinarySafe(dir / fmt::format("{}{}", levelId, json ? ".gdr.json" : ".gdr"), ByteSpan(data));
+            (void)file::writeBinarySafe(aspPath(dir / fmt::format("{}{}", levelId, json ? ".gdr.json" : ".gdr")), ByteSpan(data));
             std::string credit = fmt::format("{} by {} ({}, GD {:.4f})", o.file, o.author.empty() ? m->author : o.author, o.source, m->gameVersion);
             Macro got = std::move(*m);
             queueInMainThread([got, credit, levelId, o] {
@@ -6546,7 +6581,7 @@ namespace online {
         }
         bool autoTps = Mod::get()->getSettingValue<bool>("macro-auto-tps");
         std::thread([levelId, print, tps, skip, forceTps, autoTps] {
-            auto res = web::WebRequest().timeout(std::chrono::seconds(15)).userAgent("ClickBeforeFrames")
+            auto res = web::WebRequest().timeout(asp::Duration::fromSecs(15)).userAgent("ClickBeforeFrames")
                 .getSync(fmt::format("{}/api/runs?level={}&hash={}&tps={}{}", online::URL, levelId, print, tps, skip.empty() ? "" : "&skip=" + skip));
             std::optional<Macro> got;
             int confirms = 0, replays = 0, fails = 0;
@@ -6711,7 +6746,7 @@ namespace online {
                 float x = 0.f, y = 0.f, w = 0.f, h = 0.f;
                 // test 60: test 59's big marks (what killed you, grown) are left out when loaded
                 if ((in >> x >> y >> w >> h) && w <= 30.f && h <= 30.f) {
-                    buf.autoDangers.push_back(CCRect(x, y, w, h));
+                    rememberDanger(CCRect(x, y, w, h));
                 }
             }
             else if (kind == "p") {
@@ -7277,7 +7312,7 @@ namespace online {
         autoplay.brainReported = true;
         std::string body = fmt::format(R"({{"id":"{}","key":"{}","ok":{}}})", online::id(), autoplay.brainKey, ok ? "true" : "false");
         std::thread([body] {
-            (void)web::WebRequest().timeout(std::chrono::seconds(15)).userAgent("ClickBeforeFrames").header("Content-Type", "application/json")
+            (void)web::WebRequest().timeout(asp::Duration::fromSecs(15)).userAgent("ClickBeforeFrames").header("Content-Type", "application/json")
                 .bodyString(body).postSync(std::string(online::URL) + "/api/runs/result");
         }).detach();
     }
@@ -7312,7 +7347,7 @@ namespace online {
         size_t n = autoplay.runFlips.size();
         size_t pos = autoplay.runFixes.size();
         std::thread([body, n, pos] {
-            auto res = web::WebRequest().timeout(std::chrono::seconds(20)).userAgent("ClickBeforeFrames").header("Content-Type", "application/json")
+            auto res = web::WebRequest().timeout(asp::Duration::fromSecs(20)).userAgent("ClickBeforeFrames").header("Content-Type", "application/json")
                 .bodyString(body).postSync(std::string(online::URL) + "/api/runs");
             bool confirmed = res.ok() && res.string().unwrapOr("").find("\"confirmed\":true") != std::string::npos;
             queueInMainThread([ok = res.ok(), confirmed, n, pos] {
@@ -12360,7 +12395,7 @@ private:
     void onMacros(CCObject*) {
         std::error_code ec;
         std::filesystem::create_directories(macroDir(), ec);
-        file::openFolder(macroDir());
+        file::openFolder(aspPath(macroDir()));
     }
 
     void onTakeOver(CCObject*) {
@@ -12637,7 +12672,7 @@ class $modify(BufPlayLayer, PlayLayer) {
                 // (test 59 also marked what killed you and grew a spot you died at again: in
                 // Aquamarine's 48% wave two grown marks closed the gap between them, and every route
                 // there was "stuck". Test 60: back to the spot where you died only)
-                buf.autoDangers.push_back(CCRect(r.getMidX() - w / 2.f, r.getMidY() - h / 2.f, w, h));
+                rememberDanger(CCRect(r.getMidX() - w / 2.f, r.getMidY() - h / 2.f, w, h));
                 say("  the ghost didn't see this: the spot is marked, autoplay keeps out of it ({} marked)", buf.autoDangers.size());
             }
             autoplay.diedThisAttempt = true;
@@ -12692,7 +12727,7 @@ class $modify(BufPlayLayer, PlayLayer) {
         finishDrift(" (died)");
     }
 
-    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
+    bool init(GJGameLevel* level, bool dontCreateObjects) {
         // v2.99.6: the last level was replaced without being quit (seen with Versus, which
         // opens levels on its own). Its nodes are already freed, and the new level can even
         // be created at the same address, so `buf.owner == this` matched during loading and
@@ -12701,7 +12736,7 @@ class $modify(BufPlayLayer, PlayLayer) {
         if (buf.owner) {
             forgetLeftLevel();
         }
-        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) {
+        if (!PlayLayer::init(level, dontCreateObjects)) {
             return false;
         }
         dropGhosts();
@@ -12879,10 +12914,34 @@ class $modify(BufPlayLayer, PlayLayer) {
         memoryKey.clear();
         buf.hintLabel = nullptr;
         buf.heatNode = nullptr;
+        // Save the refs before forgetting them: dropGhosts must not touch the old
+        // level's nodes, but the detached ghost layer is self-contained, so we can
+        // still drop our own retains instead of leaking a hidden player per level.
+        auto* old1 = buf.ghost1;
+        auto* old2 = buf.ghost2;
+        auto* oldLayer = buf.ghostLayer;
         buf.ghost1 = nullptr;
         buf.ghost2 = nullptr;
         buf.ghostLayer = nullptr;
         dropGhosts();  // with the ghosts gone this only clears pointers and state
+#ifndef GEODE_IS_ANDROID
+        // Android keeps the old workaround (let go only): freeing the ghosts while
+        // its level is being torn down crashes there.
+        for (auto* g : { old1, old2 }) {
+            if (g) {
+                g->removeFromParentAndCleanup(true);
+                g->release();
+            }
+        }
+        if (oldLayer) {
+            oldLayer->removeAllChildrenWithCleanup(true);
+            oldLayer->release();
+        }
+#else
+        (void)old1;
+        (void)old2;
+        (void)oldLayer;
+#endif
         forgetAutoplay();
     }
 
@@ -13027,7 +13086,7 @@ class $modify(BufEffectGameObject, EffectGameObject) {
         (void)self.setHookPriority("EffectGameObject::triggerObject", HOOK_PRIORITY);
     }
 
-    void triggerObject(GJBaseGameLayer* layer, int uniqueID, gd::vector<int> const* remapKeys) {
+    void triggerObject(GJBaseGameLayer* layer, int uniqueID, std::vector<int> const* remapKeys) {
         if (buf.simulating) {
             return;
         }
@@ -13125,21 +13184,6 @@ class $modify(BufPlayerObject, PlayerObject) {
         (void)self.setHookPriority("PlayerObject::update", HOOK_PRIORITY);
         (void)self.setHookPriority("PlayerObject::incrementJumps", HOOK_PRIORITY);
         (void)self.setHookPriority("PlayerObject::ringJump", HOOK_PRIORITY);
-    }
-
-    // v3.0 test 27: a hidden player past the screen: GD has no objects for it out there, so the
-    // level index adds the ones near it, inside GD's collision step (before it settles landing),
-    // leaving out the ones GD did give it this step
-    void postCollision(float dt, bool betweenSteps) {
-        if (buf.simulating && buf.inCheck && isGhost(this)) {
-            buf.postCollisionSeen = true;
-            if (buf.offscreenFill && !buf.objIndex.empty()) {
-                if (auto* layer = GameManager::get()->m_playLayer) {
-                    injectOffscreen(layer, this, dt);
-                }
-            }
-        }
-        PlayerObject::postCollision(dt, betweenSteps);
     }
 
     // Runs 240x/sec per player. Ghost steps (during a simulation) skip straight to
@@ -13588,12 +13632,12 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         return GJBaseGameLayer::canBeActivatedByPlayer(player, object);
     }
 
-    void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* objects, int objectCount, float dt) {
+    void collisionCheckObjects(PlayerObject* player, std::vector<GameObject*>* objects, int objectCount, float dt) {
         if (!buf.simulating) {
             GJBaseGameLayer::collisionCheckObjects(player, objects, objectCount, dt);
             return;
         }
-        static gd::vector<GameObject*> relevant;
+        static std::vector<GameObject*> relevant;
         relevant.clear();
         if (static_cast<int>(relevant.capacity()) < objectCount) {
             relevant.reserve(objectCount);
@@ -13717,6 +13761,20 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                 }
                 relevant.push_back(object);
             }
+        }
+        // v3.2.1: PlayerObject::postCollision is inline on some 2.2091 platforms,
+        // so Geode can't hook it. Add the off-screen objects here instead: still
+        // inside GD's collision step, and after the objects GD gave the ghost
+        // have been recorded in seenThisCheck (so none are added twice).
+        // injectOffscreen calls collisionCheckObjects again, hence the guard.
+        static bool fillingOffscreen = false;
+        if (buf.inCheck && buf.offscreenFill && !buf.objIndex.empty() && isGhost(player) && !fillingOffscreen) {
+            buf.postCollisionSeen = true;
+            fillingOffscreen = true;
+            if (auto* layer = GameManager::get()->m_playLayer) {
+                injectOffscreen(layer, player, dt);
+            }
+            fillingOffscreen = false;
         }
         GJBaseGameLayer::collisionCheckObjects(player, &relevant, static_cast<int>(relevant.size()), dt);
         for (auto* object : woke) {
@@ -13842,7 +13900,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     // Toggle orbs, orbs / pads / collectibles with groups, item and counter triggers could
     // otherwise toggle or spawn groups and change item counters for real (once per
     // prediction run, many times a click), which broke triggers in some levels.
-    void toggleGroupTriggered(int group, bool activate, gd::vector<int> const& remapKeys, int triggerID, int controlID) {
+    void toggleGroupTriggered(int group, bool activate, std::vector<int> const& remapKeys, int triggerID, int controlID) {
         if (buf.simulating) {
             // v2.75: a toggle orb that switches a group off: the ghost stops colliding with
             // that group for the rest of this prediction (the real objects aren't touched)
@@ -13855,7 +13913,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         GJBaseGameLayer::toggleGroupTriggered(group, activate, remapKeys, triggerID, controlID);
     }
 
-    void spawnGroup(int group, bool ordered, double delay, gd::vector<int> const& remapKeys, int triggerID, int controlID) {
+    void spawnGroup(int group, bool ordered, double delay, std::vector<int> const& remapKeys, int triggerID, int controlID) {
         if (buf.simulating) {
             return;
         }
@@ -13895,7 +13953,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         GJBaseGameLayer::activateItemEditTrigger(object);
     }
 
-    void activateItemCompareTrigger(ItemTriggerGameObject* object, gd::vector<int> const& remapKeys) {
+    void activateItemCompareTrigger(ItemTriggerGameObject* object, std::vector<int> const& remapKeys) {
         if (buf.simulating) {
             return;
         }
