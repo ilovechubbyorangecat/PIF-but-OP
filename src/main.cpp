@@ -5735,8 +5735,8 @@ namespace online {
         return static_cast<double>(std::max<int64_t>(240, Mod::get()->getSettingValue<int64_t>("tps")));
     }
 
-    // v3.1.1: the steps a second the game really runs (the TPS setting doesn't change it on 2.2081:
-    // Grief's 360 TPS macro was played at 240 by time and died at once)
+// v3.1.1: the steps a second the game really runs (the TPS setting doesn't change it on 2.2091:
+// Grief's 360 TPS macro was played at 240 by time and died at once)
     double physicsTps() {
         if (tpsOverride > 0) {
             return tpsOverride;
@@ -6220,7 +6220,7 @@ namespace online {
                 return a.downloads > b.downloads;
             });
             // test 77: up to 8 are downloaded and read; the one made at your TPS on the newest GD
-            // (2.207+ first: macros from older 2.2 versions can go wrong in 2.2081), then approved, then
+            // (2.207+ first: macros from older 2.2 versions can go wrong in 2.2091), then approved, then
             // the most downloaded. Ones that failed you before are skipped.
             struct Pick {
                 OnlineMacro o;
