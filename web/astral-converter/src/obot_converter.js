@@ -428,7 +428,7 @@ export class Converter {
     }
     /**
     * Sets the game version written into Astral V9 (.ast) saves, e.g.
-    * "2.2081" or "2.113". Empty leaves the field at the format default.
+    * "2.2091" or "2.113". Empty leaves the field at the format default.
     * @param {string} value
     */
     set_setting_ast_game_version(value) {
