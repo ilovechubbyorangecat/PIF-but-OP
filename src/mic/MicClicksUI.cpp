@@ -306,11 +306,12 @@ void MicSetupPopup::refresh() {
         m_meter->drawSegment({ floor_x, -3.f }, { floor_x, 3.f }, 1.f, { 1.f, 0.85f, 0.3f, 0.9f });
     }
 
-    // "jit" is the capture->monitor jitter buffer: how much audio is queued, how often it ran
-    // dry and how many frames were trimmed to keep the drift from growing the latency.
-    setLabel(m_stats, fmt::format("clicks {}  paired {}  sched {}  late {}  drop {}  voice x{}  jit {}ms u{} t{}",
+    // "v/8" is how many click voices played in the last render block (s = how often the oldest
+    // had to be stolen because all eight were busy), "jit" is the capture->monitor jitter buffer:
+    // queued audio, times it ran dry, frames trimmed to keep the drift from growing the latency.
+    setLabel(m_stats, fmt::format("clicks {}  pairs {}  sched {}  late {}  drop {}  v{}/8 s{}  jit {}ms u{} t{}",
                         status.accepted, status.windowPairs, status.scheduled, status.lateClicks, status.droppedClicks,
-                        status.rejectedSustained, status.monitorFillMs, status.monitorUnderruns, status.monitorTrims));
+                        status.voices, status.voiceSteals, status.monitorFillMs, status.monitorUnderruns, status.monitorTrims));
 
     if (m_calibrate) {
         m_calibrate->setColor(status.calibrating ? kMuted : kText);

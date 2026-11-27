@@ -203,10 +203,14 @@ bool MicEngine::start(EngineConfig const& config, std::string& error) {
 
     m_ring.resize(kSampleRate * 4);
     configureMonitorBuffer();
+    m_clickMixer.reset();
+    m_monitorGate.configure(kSampleRate, kMonitorGateAttackMs, kMonitorGateReleaseMs);
+    m_monitorGate.reset(0.f);
+    m_voiceCount.store(0, std::memory_order_relaxed);
+    m_voiceSteals.store(0, std::memory_order_relaxed);
     m_clickQueue.clear();
     m_inputQueue.clear();
     m_deliveryQueue.clear();
-    m_activeCount = 0;
     m_lock.reset();
     m_statDetections = m_statScheduled = m_statLate = m_statDropped = m_statUnmatched = 0;
     m_leadEmaMs = 45.0;
@@ -227,7 +231,9 @@ void MicEngine::stop() {
     if (m_worker.joinable()) {
         m_worker.join();
     }
-    m_activeCount = 0;
+    m_clickMixer.reset();
+    m_monitorGate.reset(0.f);
+    m_voiceCount.store(0, std::memory_order_relaxed);
     m_monitorJitter.reset();
     m_calibrating.store(false);
     m_calibrationPhase.store(0);
@@ -324,67 +330,73 @@ size_t MicEngine::onRender(float* stereo, size_t frames) {
     uint64_t blockStart = m_renderFrame.load(std::memory_order_relaxed);
     m_renderTimeNs.store(nowNs(), std::memory_order_relaxed);
     m_renderFrame.store(blockStart + frames, std::memory_order_relaxed);
-    std::memset(stereo, 0, frames * 2 * sizeof(float));
+    if (!stereo || frames == 0) {
+        return 0;
+    }
 
+    // ---- real-time safety ------------------------------------------------------------
+    // Everything below runs on the audio thread: no allocation (all buffers are members),
+    // no mutex, no logging, no blocking call. The only cross-thread handovers are the SPSC
+    // click queue and the SPSC jitter buffer, both wait-free.
     if (m_clearOutput.exchange(false, std::memory_order_acq_rel)) {
-        m_activeCount = 0;
+        m_clickMixer.reset();
+        m_monitorGate.reset(0.f);
+        m_voiceCount.store(0, std::memory_order_relaxed);
     }
 
-    while (m_activeCount < std::size(m_active)) {
-        if (!m_clickQueue.pop(m_active[m_activeCount])) {
-            break;
-        }
-        ++m_activeCount;
-    }
-
+    // Take whatever the DSP thread scheduled since the last callback and hand it to a voice.
     float clickGain = m_clickGain.load(std::memory_order_relaxed);
-    for (size_t i = 0; i < m_activeCount;) {
-        ClickSlice& click = m_active[i];
-        int64_t rel = static_cast<int64_t>(click.startFrame) - static_cast<int64_t>(blockStart);
-        if (rel + static_cast<int64_t>(click.length) <= 0) {
-            m_active[i] = m_active[--m_activeCount];  // started and finished before this block
-            continue;
-        }
-        size_t from = rel < 0 ? static_cast<size_t>(-rel) : 0;
-        for (size_t j = from; j < click.length; ++j) {
-            int64_t at = rel + static_cast<int64_t>(j);
-            if (at < 0) {
-                continue;
-            }
-            if (at >= static_cast<int64_t>(frames)) {
-                break;
-            }
-            float value = click.samples[j] * click.gain * clickGain;
-            stereo[static_cast<size_t>(at) * 2] += value;
-            stereo[static_cast<size_t>(at) * 2 + 1] += value;
-        }
-        if (rel + static_cast<int64_t>(click.length) <= static_cast<int64_t>(frames)) {
-            m_active[i] = m_active[--m_activeCount];
-        }
-        else {
-            ++i;
-        }
+    while (m_clickQueue.pop(m_popScratch)) {
+        m_clickMixer.start(m_popScratch.samples.data(), m_popScratch.length, m_popScratch.startFrame, clickGain);
     }
+    m_voiceSteals.store(static_cast<int>(m_clickMixer.stolenVoices()), std::memory_order_relaxed);
 
     bool monitorEverything = m_monitor.load(std::memory_order_relaxed) &&
         m_monitorMode.load(std::memory_order_relaxed) == static_cast<int>(MonitorMode::Everything);
-    if (monitorEverything && m_monitorJitter.configured()) {
-        float gain = m_monitorGain.load(std::memory_order_relaxed);
-        // The jitter buffer always returns exactly the frames asked for: silence where the
-        // microphone has not delivered yet (underrun), never a replay of audio we already
-        // played. That is the difference between a quiet gap and a crackle.
-        size_t offset = 0;
-        while (offset < frames) {
-            size_t chunk = std::min(frames - offset, m_monitorScratch.size());
-            m_monitorJitter.read(m_monitorScratch.data(), chunk);
-            for (size_t i = 0; i < chunk; ++i) {
-                float value = m_monitorScratch[i] * gain;
-                stereo[(offset + i) * 2] += value;
-                stereo[(offset + i) * 2 + 1] += value;
-            }
-            offset += chunk;
-        }
+    bool monitorReady = monitorEverything && m_monitorJitter.configured();
+    float monitorGain = m_monitorGain.load(std::memory_order_relaxed);
+    if (!monitorReady) {
+        // Nothing continuous is playing: keep the gate shut so switching it on fades in
+        // instead of starting with a step.
+        m_monitorGate.reset(0.f);
     }
+
+    int voicesThisBlock = 0;
+    size_t offset = 0;
+    while (offset < frames) {
+        size_t chunk = std::min(frames - offset, kMixChunkFrames);
+        float* mix = m_mixScratch.data();
+        std::memset(mix, 0, chunk * 2 * sizeof(float));
+
+        voicesThisBlock = std::max(voicesThisBlock, static_cast<int>(m_clickMixer.mix(mix, chunk, blockStart + offset)));
+
+        // The jitter buffer returns exactly `chunk` mono frames: silence where the microphone has
+        // not delivered yet (underrun), never a replay of audio we already played. It is drained
+        // even while the monitor is off, so switching it back on starts on fresh audio instead of
+        // a backlog of stale samples.
+        size_t taken = m_monitorJitter.configured()
+            ? m_monitorJitter.read(m_monitorScratch.data(), chunk)
+            : 0;
+        if (monitorReady) {
+            // The gate ramps over the underrun boundary (8 ms attack / 30 ms release), so a
+            // re-prime is a fade instead of a chop.
+            for (size_t i = 0; i < chunk; ++i) {
+                float gate = m_monitorGate.next(i < taken);
+                float value = m_monitorScratch[i] * monitorGain * gate;
+                mix[i * 2] += value;
+                mix[i * 2 + 1] += value;
+            }
+        }
+
+        // Clicks + monitor together, soft limited: eight overlapping clicks compress smoothly
+        // instead of clipping, and the monitor feed can never push the sum over full scale.
+        ClickMixer::softLimit(mix, chunk);
+
+        std::memcpy(stereo + offset * 2, mix, chunk * 2 * sizeof(float));
+        offset += chunk;
+    }
+
+    m_voiceCount.store(voicesThisBlock, std::memory_order_relaxed);
     return frames;
 }
 
@@ -812,7 +824,7 @@ void MicEngine::scheduleClick(bool down, int64_t targetNs, uint64_t onsetFrame, 
         ++m_statDropped;
         return;
     }
-    length = gateAndNormalize(m_sliceScratch.data(), length, kSampleRate);
+    length = groomClickSlice(m_sliceScratch.data(), length, kSampleRate).length;
     if (length == 0) {
         ++m_statDropped;
         return;
@@ -827,11 +839,10 @@ void MicEngine::scheduleClick(bool down, int64_t targetNs, uint64_t onsetFrame, 
         startFrame = static_cast<int64_t>(baseFrame);
     }
 
-    ClickSlice slice;
+    ClickSlice& slice = m_sliceMessage;
     slice.startFrame = static_cast<uint64_t>(startFrame);
     slice.length = static_cast<uint32_t>(length);
     slice.onsetOffset = static_cast<uint32_t>(onsetOffset);
-    slice.gain = m_clickGain.load(std::memory_order_relaxed);
     std::memcpy(slice.samples.data(), m_sliceScratch.data(), length * sizeof(float));
     if (!m_clickQueue.push(slice)) {
         ++m_statDropped;
@@ -872,6 +883,8 @@ void MicEngine::publish() {
     next.droppedClicks = static_cast<int>(m_statDropped);
     next.unmatched = static_cast<int>(m_statUnmatched);
     next.queueDepth = static_cast<int>(m_clickQueue.size());
+    next.voices = m_voiceCount.load(std::memory_order_relaxed);
+    next.voiceSteals = m_voiceSteals.load(std::memory_order_relaxed);
     next.monitorUnderruns = static_cast<int>(m_monitorJitter.underruns());
     next.monitorTrims = static_cast<int>(m_monitorJitter.trims());
     {

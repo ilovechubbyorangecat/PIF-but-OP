@@ -16,7 +16,7 @@ inline constexpr int kBandCount = 24;      // log spaced bands used for the clic
 inline constexpr int kFftSize = 256;       // 5.3 ms at 48 kHz
 inline constexpr int kSampleRate = 48000;  // capture and render rate (the backend converts)
 inline constexpr int kHopFrames = 64;      // 1.3 ms analysis hop
-inline constexpr int kMaxSliceFrames = 9600;  // 200 ms of click audio (pre-roll + tail)
+inline constexpr int kMaxSliceFrames = 4096;  // 85 ms of click audio (12 ms pre-roll + 45 ms tail)
 
 inline int64_t nowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
