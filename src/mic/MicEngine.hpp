@@ -26,11 +26,19 @@
 #include "AudioRing.hpp"
 #include "Dsp.hpp"
 #include "Fingerprint.hpp"
+#include "JitterBuffer.hpp"
 #include "RhythmLock.hpp"
 #include "SpscQueue.hpp"
 #include "TransientDetector.hpp"
 
 namespace micclicks {
+
+// The microphone and the click output have independent clocks, so the monitoring path runs
+// through a jitter buffer: 12 ms of pre-roll absorbs the drift, anything above 40 ms of lag is
+// trimmed back, and 300 ms is as much as we ever hold (if the output device stops draining).
+inline constexpr int kMonitorPreRollMs = 12;
+inline constexpr int kMonitorMaxLagMs = 40;
+inline constexpr int kMonitorCapacityMs = 300;
 
 enum class MonitorMode : int {
     ClicksOnly = 0,
@@ -88,6 +96,12 @@ struct EngineStatus {
     int droppedClicks = 0;
     int unmatched = 0;
     int queueDepth = 0;
+    // monitoring (jitter buffer) health and the negotiated render format
+    int monitorUnderruns = 0;
+    int monitorTrims = 0;
+    int monitorFillMs = 0;
+    int renderSampleRate = 0;
+    int renderPeriodFrames = 0;
     char captureDevice[96] = {};
     char renderDevice[96] = {};
     char backend[48] = {};
@@ -142,11 +156,6 @@ private:
         std::array<float, kMaxSliceFrames> samples {};
     };
 
-    struct MonitorBlock {
-        uint32_t frames = 0;
-        std::array<float, kHopFrames> samples {};
-    };
-
     struct InputMessage {
         int64_t timeNs = 0;
         int64_t tick = 0;
@@ -199,6 +208,7 @@ private:
     void stopDevices();
     bool startDevices(std::string& error);
     static int resolveDevice(std::vector<audio::DeviceInfo> const& devices, std::string const& name);
+    void configureMonitorBuffer();
     int64_t leadNs() const;
     int64_t minAudibleLeadNs() const;
     int64_t overrideNs() const;
@@ -229,7 +239,9 @@ private:
     // queues
     AudioRing m_ring;
     SpscQueue<ClickSlice, 8> m_clickQueue;
-    SpscQueue<MonitorBlock, 64> m_monitorQueue;
+    JitterBuffer m_monitorJitter;
+    std::array<float, 2048> m_monitorScratch {};
+    std::atomic<bool> m_monitorReset { false };
     SpscQueue<InputMessage, 256> m_inputQueue;
     SpscQueue<DeliveryMessage, 256> m_deliveryQueue;
     std::atomic<uint32_t> m_inputOverflow { 0 };
@@ -247,8 +259,12 @@ private:
     double m_leadEmaMs = 14.0;
     int64_t m_lastDetectionNs = 0;
 
-    // render clock published by the callback
+    // render clock and the buffer the backend gave us (main thread writes, worker reads)
     std::atomic<uint64_t> m_renderFrame { 0 };
+    std::atomic<int64_t> m_minLeadNs { 11'000'000 };
+    std::atomic<uint32_t> m_renderSampleRate { 0 };
+    std::atomic<uint32_t> m_renderPeriodFrames { 0 };
+    std::atomic<uint32_t> m_renderPeriods { 0 };
     std::atomic<int64_t> m_renderTimeNs { 0 };
     std::atomic<float> m_capturePeakDb { -120.f };
     ClickSlice m_active[6];

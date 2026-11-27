@@ -45,6 +45,16 @@ the buffer holds the input back.
 **No main-thread work.** FFT, detection, slicing, mixing and device I/O all happen off-thread behind
 lock-free single-producer/single-consumer queues; the game hooks only push a timestamp.
 
+**No crackle.** All three device paths (microphone, monitoring, click output) are opened at 48 kHz
+float in WASAPI *shared* mode - never exclusive, so Windows does not fight VB-Cable or OBS for the
+device - with 10 ms periods and two periods per buffer (20 ms). Tiny 1-5 ms periods are what makes
+shared-mode WASAPI stutter, because the shared engine only hands buffers back in ~10 ms quanta. The
+monitoring path runs through a jitter buffer with a 12 ms pre-roll: the microphone and the output
+device have independent clocks, so the pre-roll absorbs the drift, an underrun plays silence (never a
+repeat of audio already played, which is what a crackle actually is), and once more than 40 ms is
+queued the oldest frames are trimmed so the monitoring latency never creeps up. The panel's status
+line shows the negotiated `kHz / ms`, and its stats line shows `jit <ms> u<underruns> t<trims>`.
+
 | setting | default | what it does |
 | --- | --- | --- |
 | Mic Clicks: play your real clicks | off | master switch |
