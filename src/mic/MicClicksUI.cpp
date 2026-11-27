@@ -216,7 +216,11 @@ void MicSetupPopup::refresh() {
         setLabel(m_status, clicks.enabled() ? "Engine stopped: " + engine.backendName() : "Mic Clicks is off (Enable below)");
     }
     else {
-        setLabel(m_status, fmt::format("{}  |  mic: {}  |  out: {}", engine.backendName(), status.captureDevice, status.renderDevice));
+        int rate = status.renderSampleRate > 0 ? status.renderSampleRate : audio::kBackendSampleRate;
+        int periodMs = (status.renderPeriodFrames > 0 && rate > 0) ? (status.renderPeriodFrames * 1000 + rate / 2) / rate
+                                                                   : static_cast<int>(audio::kDefaultPeriodMs);
+        setLabel(m_status, fmt::format("{}  |  {} kHz / {} ms  |  mic: {}  |  out: {}", engine.backendName(),
+                            static_cast<double>(rate) / 1000.0, periodMs, status.captureDevice, status.renderDevice));
     }
 
     setLabel(m_captureLabel, deviceName(clicks.captureDevices(), config.captureName));
@@ -302,9 +306,11 @@ void MicSetupPopup::refresh() {
         m_meter->drawSegment({ floor_x, -3.f }, { floor_x, 3.f }, 1.f, { 1.f, 0.85f, 0.3f, 0.9f });
     }
 
-    setLabel(m_stats, fmt::format("clicks {}  paired {}  sched {}  late {}  drop {}  voice x{}  plain-gate misses {}",
+    // "jit" is the capture->monitor jitter buffer: how much audio is queued, how often it ran
+    // dry and how many frames were trimmed to keep the drift from growing the latency.
+    setLabel(m_stats, fmt::format("clicks {}  paired {}  sched {}  late {}  drop {}  voice x{}  jit {}ms u{} t{}",
                         status.accepted, status.windowPairs, status.scheduled, status.lateClicks, status.droppedClicks,
-                        status.rejectedSustained, status.naiveMissed));
+                        status.rejectedSustained, status.monitorFillMs, status.monitorUnderruns, status.monitorTrims));
 
     if (m_calibrate) {
         m_calibrate->setColor(status.calibrating ? kMuted : kText);

@@ -11,7 +11,9 @@
 //   * the fingerprint detector finds the clicks a plain amplitude gate misses,
 //   * the voice is rejected instead of becoming fake clicks,
 //   * slices can be cut out of the rolling ring buffer,
-//   * rhythm lock recovers an injected latency and its drift.
+//   * rhythm lock recovers an injected latency and its drift,
+//   * the capture -> monitor jitter buffer pre-rolls, never replays stale audio on an underrun
+//     and trims itself back when two device clocks drift apart.
 
 #include <algorithm>
 #include <cmath>
@@ -23,6 +25,7 @@
 
 #include "AudioRing.hpp"
 #include "Dsp.hpp"
+#include "JitterBuffer.hpp"
 #include "Fingerprint.hpp"
 #include "RhythmLock.hpp"
 #include "Slicer.hpp"
@@ -381,6 +384,86 @@ int main() {
     check(!small.readHistory(0, &last, 1), "old frames outside the window are reported as gone");
     small.skipToLatest();
     check(small.available() == 0, "skipToLatest drops stale audio");
+
+    // ---- jitter buffer (capture -> monitor, two independent device clocks) -------------
+    {
+        JitterBuffer jitter;
+        size_t const block = 480;               // 10 ms render periods at 48 kHz
+        size_t const preRoll = 576;             // 12 ms
+        jitter.configure(12000, preRoll, 1920);  // 250 ms capacity, 40 ms max lag
+
+        std::vector<float> produced(block), consumed(block);
+        for (size_t i = 0; i < block; ++i) {
+            produced[i] = static_cast<float>(i + 1);
+        }
+
+        // Before the pre-roll is queued the render callback must be silent, not starved repeats.
+        jitter.write(produced.data(), 240);
+        size_t got = jitter.read(consumed.data(), block);
+        bool allSilent = true;
+        for (float v : consumed) {
+            allSilent = allSilent && v == 0.f;
+        }
+        check(got == 0 && allSilent, "the jitter buffer stays silent until its pre-roll is queued");
+
+        // Fill the pre-roll and read: the first block must be the oldest queued audio, in order.
+        std::vector<float> ramp(1200);
+        for (size_t i = 0; i < ramp.size(); ++i) {
+            ramp[i] = static_cast<float>(i);
+        }
+        jitter.dropQueued();
+        jitter.write(ramp.data(), ramp.size());
+        got = jitter.read(consumed.data(), block);
+        bool inOrder = got == block;
+        for (size_t i = 0; i < got && inOrder; ++i) {
+            inOrder = consumed[i] == ramp[i];
+        }
+        check(inOrder, "after the pre-roll, queued audio is delivered in order");
+
+        // Underrun: prime, drain, then ask for a full block with almost nothing queued. The head
+        // has to be real audio, the tail silence (never a repeat of what was played), and the
+        // buffer has to re-prime for the next block.
+        jitter.dropQueued();
+        jitter.write(ramp.data(), preRoll);
+        (void)jitter.read(consumed.data(), block);
+        uint32_t underrunsBefore = jitter.underruns();
+        got = jitter.read(consumed.data(), block);
+        bool tailSilent = true;
+        for (size_t i = got; i < block; ++i) {
+            tailSilent = tailSilent && consumed[i] == 0.f;
+        }
+        check(got > 0 && got < block && tailSilent, "a shortfall is filled with silence, not stale audio");
+        check(jitter.underruns() > underrunsBefore, "the underrun is counted");
+        got = jitter.read(consumed.data(), block);
+        allSilent = got == 0;
+        for (float v : consumed) {
+            allSilent = allSilent && v == 0.f;
+        }
+        check(allSilent, "after an underrun the buffer re-primes instead of draining garbage");
+
+        // Clock drift: the producer keeps handing over more than the consumer takes. The lag has
+        // to stay bounded by the configured maximum, with the excess trimmed away.
+        jitter.dropQueued();
+        for (int round = 0; round < 400; ++round) {
+            jitter.write(ramp.data(), block + 6);  // 1.25% faster than the consumer
+            jitter.read(consumed.data(), block);
+        }
+        double fillMs = static_cast<double>(jitter.fillFrames()) * 1000.0 / kRate;
+        std::printf("\njitter buffer: %zu frames queued (%.1f ms), %u underruns, %u trims, %u overflows\n", jitter.fillFrames(),
+            fillMs, jitter.underruns(), jitter.trims(), jitter.overflows());
+        check(fillMs < 45.0, "drifting clocks do not grow the monitoring latency");
+        check(jitter.trims() > 0, "the excess is trimmed back");
+        check(jitter.overflows() == 0, "the buffer never overflowed");
+
+        // A stopped consumer (monitor off) must drop instead of overrunning the queue.
+        jitter.dropQueued();
+        size_t accepted = 0;
+        for (int round = 0; round < 200; ++round) {
+            accepted += jitter.write(ramp.data(), block);
+        }
+        check(accepted < 200 * block && jitter.overflows() > 0, "a stopped output drops audio instead of overrunning");
+        check(jitter.fillFrames() <= jitter.capacityFrames(), "the jitter buffer never exceeds its capacity");
+    }
 
     std::printf("\n%s (%d failure%s)\n", failures == 0 ? "PASS" : "FAILED", failures, failures == 1 ? "" : "s");
     return failures == 0 ? 0 : 1;

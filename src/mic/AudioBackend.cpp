@@ -50,9 +50,45 @@ namespace micclicks::audio {
 
 namespace {
 
+// One place for the device settings both streams share: 48 kHz float, a 10 ms period, two
+// periods (a stable double buffer), always shared mode (so Windows does not hand exclusive
+// control of VB-Cable / the headset to us), and the highest low-pass order for miniaudio's
+// internal resampler in case the hardware cannot run at 48 kHz.
+void applyCommonConfig(ma_device_config& config, int sampleRate, uint32_t periodMs, uint32_t periods, bool sharedMode) {
+    config.sampleRate = static_cast<ma_uint32>(sampleRate > 0 ? sampleRate : kBackendSampleRate);
+    config.periodSizeInMilliseconds = periodMs == 0 ? kDefaultPeriodMs : periodMs;
+    config.periodSizeInFrames = 0;
+    config.periods = periods == 0 ? kDefaultPeriods : periods;
+    config.performanceProfile = ma_performance_profile_low_latency;
+    // miniaudio's data converter resamples when the device refuses 48 kHz float; give it the
+    // strongest linear low-pass so 44.1 kHz hardware does not alias into the click fingerprint.
+    config.resampling.algorithm = ma_resample_algorithm_linear;
+    config.resampling.linear.lpfOrder = MA_MAX_FILTER_ORDER;
+    config.playback.shareMode = sharedMode ? ma_share_mode_shared : ma_share_mode_exclusive;
+    config.capture.shareMode = sharedMode ? ma_share_mode_shared : ma_share_mode_exclusive;
+    config.wasapi.noAutoStreamRouting = MA_FALSE;  // follow the default device if it moves
+}
+
+StreamInfo makeInfo(ma_device const& device, bool capture, bool sharedMode) {
+    StreamInfo info;
+    info.sampleRate = device.sampleRate;
+    info.sharedMode = sharedMode;
+    if (capture) {
+        info.deviceSampleRate = device.capture.internalSampleRate;
+        info.periodFrames = device.capture.internalPeriodSizeInFrames;
+        info.periods = device.capture.internalPeriods;
+    }
+    else {
+        info.deviceSampleRate = device.playback.internalSampleRate;
+        info.periodFrames = device.playback.internalPeriodSizeInFrames;
+        info.periods = device.playback.internalPeriods;
+    }
+    return info;
+}
+
 class MiniCapture final : public CaptureStream {
 public:
-    MiniCapture(ma_context* context, ma_device_id const* deviceId, int sampleRate, CaptureSink sink, void* user)
+    MiniCapture(ma_context* context, ma_device_id const* deviceId, CaptureRequest const& request, CaptureSink sink, void* user)
         : m_sink(sink), m_user(user) {
         ma_device_config config = ma_device_config_init(ma_device_type_capture);
         config.capture.format = ma_format_f32;
@@ -62,13 +98,12 @@ public:
             m_haveDeviceId = true;
             config.capture.pDeviceID = &m_deviceId;
         }
-        config.sampleRate = static_cast<ma_uint32>(sampleRate);
-        config.periodSizeInMilliseconds = 5;
-        config.performanceProfile = ma_performance_profile_low_latency;
+        applyCommonConfig(config, request.sampleRate, request.periodMs, request.periods, request.sharedMode);
         config.dataCallback = &MiniCapture::onData;
         config.pUserData = this;
         m_result = ma_device_init(context, &config, &m_device);
         m_ready = m_result == MA_SUCCESS;
+        m_sharedMode = request.sharedMode;
     }
 
     ~MiniCapture() override {
@@ -98,6 +133,10 @@ public:
         }
     }
 
+    StreamInfo info() const override {
+        return m_ready ? makeInfo(m_device, true, m_sharedMode) : StreamInfo {};
+    }
+
 private:
     static void onData(ma_device* device, void* output, void const* input, ma_uint32 frameCount) {
         (void)output;
@@ -113,13 +152,14 @@ private:
     ma_result m_result = MA_ERROR;
     bool m_ready = false;
     bool m_haveDeviceId = false;
+    bool m_sharedMode = true;
     CaptureSink m_sink = nullptr;
     void* m_user = nullptr;
 };
 
 class MiniRender final : public RenderStream {
 public:
-    MiniRender(ma_context* context, ma_device_id const* deviceId, int sampleRate, RenderPull pull, void* user)
+    MiniRender(ma_context* context, ma_device_id const* deviceId, RenderRequest const& request, RenderPull pull, void* user)
         : m_pull(pull), m_user(user) {
         ma_device_config config = ma_device_config_init(ma_device_type_playback);
         config.playback.format = ma_format_f32;
@@ -129,13 +169,12 @@ public:
             m_haveDeviceId = true;
             config.playback.pDeviceID = &m_deviceId;
         }
-        config.sampleRate = static_cast<ma_uint32>(sampleRate);
-        config.periodSizeInMilliseconds = 5;
-        config.performanceProfile = ma_performance_profile_low_latency;
+        applyCommonConfig(config, request.sampleRate, request.periodMs, request.periods, request.sharedMode);
         config.dataCallback = &MiniRender::onData;
         config.pUserData = this;
         m_result = ma_device_init(context, &config, &m_device);
         m_ready = m_result == MA_SUCCESS;
+        m_sharedMode = request.sharedMode;
     }
 
     ~MiniRender() override {
@@ -165,6 +204,10 @@ public:
         }
     }
 
+    StreamInfo info() const override {
+        return m_ready ? makeInfo(m_device, false, m_sharedMode) : StreamInfo {};
+    }
+
 private:
     static void onData(ma_device* device, void* output, void const* input, ma_uint32 frameCount) {
         (void)input;
@@ -189,6 +232,7 @@ private:
     ma_result m_result = MA_ERROR;
     bool m_ready = false;
     bool m_haveDeviceId = false;
+    bool m_sharedMode = true;
     RenderPull m_pull = nullptr;
     void* m_user = nullptr;
 };
@@ -263,7 +307,7 @@ public:
             return nullptr;
         }
         ma_device_id const* id = lookup(m_captureIds, request.deviceId);
-        auto stream = std::make_unique<MiniCapture>(&m_context, id, request.sampleRate, request.sink, request.user);
+        auto stream = std::make_unique<MiniCapture>(&m_context, id, request, request.sink, request.user);
         if (!stream->ready()) {
             error = std::string("capture device: ") + ma_result_description(stream->result());
             return nullptr;
@@ -277,7 +321,7 @@ public:
             return nullptr;
         }
         ma_device_id const* id = lookup(m_renderIds, request.deviceId);
-        auto stream = std::make_unique<MiniRender>(&m_context, id, request.sampleRate, request.pull, request.user);
+        auto stream = std::make_unique<MiniRender>(&m_context, id, request, request.pull, request.user);
         if (!stream->ready()) {
             error = std::string("output device: ") + ma_result_description(stream->result());
             return nullptr;

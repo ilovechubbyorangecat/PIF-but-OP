@@ -109,7 +109,10 @@ bool MicEngine::startDevices(std::string& error) {
 
     audio::CaptureRequest capture;
     capture.deviceId = captureId;
-    capture.sampleRate = kSampleRate;
+    capture.sampleRate = audio::kBackendSampleRate;
+    capture.periodMs = audio::kDefaultPeriodMs;
+    capture.periods = audio::kDefaultPeriods;
+    capture.sharedMode = true;
     capture.user = this;
     capture.sink = &MicEngine::captureCallback;
     m_captureStream = m_backend->openCapture(capture, enumError);
@@ -120,7 +123,10 @@ bool MicEngine::startDevices(std::string& error) {
 
     audio::RenderRequest render;
     render.deviceId = renderId;
-    render.sampleRate = kSampleRate;
+    render.sampleRate = audio::kBackendSampleRate;
+    render.periodMs = audio::kDefaultPeriodMs;
+    render.periods = audio::kDefaultPeriods;
+    render.sharedMode = true;
     render.user = this;
     render.pull = &MicEngine::renderCallback;
     m_renderStream = m_backend->openRender(render, enumError);
@@ -153,6 +159,18 @@ bool MicEngine::startDevices(std::string& error) {
         stopDevices();
         return false;
     }
+
+    // A click can only be heard once the render buffer that holds it has been handed to the
+    // device, so the scheduler has to aim at least one full device buffer ahead.
+    audio::StreamInfo info = m_renderStream->info();
+    uint32_t rate = info.sampleRate ? info.sampleRate : static_cast<uint32_t>(audio::kBackendSampleRate);
+    double bufferMs = (info.periodFrames && info.periods)
+        ? static_cast<double>(info.periodFrames) * static_cast<double>(info.periods) * 1000.0 / static_cast<double>(rate)
+        : static_cast<double>(audio::kDefaultPeriodMs * audio::kDefaultPeriods);
+    m_minLeadNs.store(static_cast<int64_t>((bufferMs + 2.0) * 1.0e6), std::memory_order_relaxed);
+    m_renderSampleRate.store(rate, std::memory_order_relaxed);
+    m_renderPeriodFrames.store(info.periodFrames, std::memory_order_relaxed);
+    m_renderPeriods.store(info.periods, std::memory_order_relaxed);
     return true;
 }
 
@@ -184,8 +202,8 @@ bool MicEngine::start(EngineConfig const& config, std::string& error) {
     m_alignMode.store(config.alignMode, std::memory_order_relaxed);
 
     m_ring.resize(kSampleRate * 4);
+    configureMonitorBuffer();
     m_clickQueue.clear();
-    m_monitorQueue.clear();
     m_inputQueue.clear();
     m_deliveryQueue.clear();
     m_activeCount = 0;
@@ -210,6 +228,7 @@ void MicEngine::stop() {
         m_worker.join();
     }
     m_activeCount = 0;
+    m_monitorJitter.reset();
     m_calibrating.store(false);
     m_calibrationPhase.store(0);
     m_pendingInputs.clear();
@@ -238,11 +257,16 @@ void MicEngine::applyConfig(EngineConfig const& config, std::string* error) {
     if (!running()) {
         return;
     }
+    if (previous.monitor != config.monitor || previous.monitorMode != config.monitorMode) {
+        // Switching the monitor on or off must not replay what was queued while it was off.
+        m_monitorReset.store(true, std::memory_order_relaxed);
+    }
     if (previous.captureName != config.captureName || previous.renderName != config.renderName) {
         // Devices are opened on the main thread only; the worker keeps running and simply
         // stops receiving audio for a moment.
         stopDevices();
         m_flushRequested.store(true, std::memory_order_relaxed);
+        m_monitorReset.store(true, std::memory_order_relaxed);
         std::string local;
         if (!startDevices(local)) {
             if (error) {
@@ -256,6 +280,12 @@ void MicEngine::applyConfig(EngineConfig const& config, std::string* error) {
         }
         publish();
     }
+}
+
+void MicEngine::configureMonitorBuffer() {
+    auto frames = [](int ms) { return static_cast<size_t>(ms) * static_cast<size_t>(kSampleRate) / 1000; };
+    m_monitorJitter.configure(frames(kMonitorCapacityMs), frames(kMonitorPreRollMs), frames(kMonitorMaxLagMs));
+    m_monitorReset.store(false, std::memory_order_relaxed);
 }
 
 void MicEngine::setMessage(std::string const& text) {
@@ -336,21 +366,23 @@ size_t MicEngine::onRender(float* stereo, size_t frames) {
         }
     }
 
-    if (m_monitor.load(std::memory_order_relaxed) && m_monitorMode.load(std::memory_order_relaxed) == static_cast<int>(MonitorMode::Everything)) {
+    bool monitorEverything = m_monitor.load(std::memory_order_relaxed) &&
+        m_monitorMode.load(std::memory_order_relaxed) == static_cast<int>(MonitorMode::Everything);
+    if (monitorEverything && m_monitorJitter.configured()) {
         float gain = m_monitorGain.load(std::memory_order_relaxed);
-        size_t written = 0;
-        while (written < frames) {
-            MonitorBlock block;
-            if (!m_monitorQueue.pop(block)) {
-                break;
+        // The jitter buffer always returns exactly the frames asked for: silence where the
+        // microphone has not delivered yet (underrun), never a replay of audio we already
+        // played. That is the difference between a quiet gap and a crackle.
+        size_t offset = 0;
+        while (offset < frames) {
+            size_t chunk = std::min(frames - offset, m_monitorScratch.size());
+            m_monitorJitter.read(m_monitorScratch.data(), chunk);
+            for (size_t i = 0; i < chunk; ++i) {
+                float value = m_monitorScratch[i] * gain;
+                stereo[(offset + i) * 2] += value;
+                stereo[(offset + i) * 2 + 1] += value;
             }
-            size_t take = std::min<size_t>(block.frames, frames - written);
-            for (size_t i = 0; i < take; ++i) {
-                float value = block.samples[i] * gain;
-                stereo[(written + i) * 2] += value;
-                stereo[(written + i) * 2 + 1] += value;
-            }
-            written += take;
+            offset += chunk;
         }
     }
     return frames;
@@ -383,6 +415,7 @@ void MicEngine::noteInput(bool down, bool delivered, int64_t timeNs, int64_t tic
 
 void MicEngine::flush() {
     m_flushRequested.store(true, std::memory_order_relaxed);
+    m_monitorReset.store(true, std::memory_order_relaxed);
 }
 
 void MicEngine::startCalibration() {
@@ -476,6 +509,16 @@ void MicEngine::workerLoop() {
         }
         m_detector.setGateScale(m_sensitivity.load(std::memory_order_relaxed));
 
+        if (m_monitorReset.exchange(false, std::memory_order_acq_rel)) {
+            m_monitorJitter.dropQueued();
+        }
+
+        bool monitorEverything = m_monitor.load(std::memory_order_relaxed) &&
+            m_monitorMode.load(std::memory_order_relaxed) == static_cast<int>(MonitorMode::Everything);
+        if (!monitorEverything) {
+            m_monitorJitter.dropQueued();
+        }
+
         double nowMs = static_cast<double>(nowNs()) / 1.0e6;
         drainInputs(nowMs);
         drainDeliveries();
@@ -563,18 +606,11 @@ void MicEngine::workerLoop() {
                 }
             }
 
-            if (m_monitor.load(std::memory_order_relaxed) && m_monitorMode.load(std::memory_order_relaxed) == static_cast<int>(MonitorMode::Everything) &&
-                got == static_cast<size_t>(kHopFrames)) {
-                MonitorBlock block;
-                block.frames = static_cast<uint32_t>(got);
-                std::memcpy(block.samples.data(), m_hopScratch.data(), got * sizeof(float));
-                if (!m_monitorQueue.push(block)) {
-                    // The monitor output stopped draining (device lost): drop instead of
-                    // letting the latency grow without bound.
-                    MonitorBlock discard;
-                    m_monitorQueue.pop(discard);
-                    (void)m_monitorQueue.push(block);
-                }
+            if (monitorEverything && got > 0) {
+                // Straight into the jitter buffer: it owns the pre-roll and the trimming, so
+                // nothing is lost at hop boundaries the way the old block queue lost the tail
+                // of a block whenever the render callback asked for fewer frames than it had.
+                m_monitorJitter.write(m_hopScratch.data(), got);
             }
         }
 
@@ -711,9 +747,10 @@ void MicEngine::tryMatchPending(double nowMs) {
 }
 
 int64_t MicEngine::minAudibleLeadNs() const {
-    // Two render periods (5 ms each) plus a millisecond of slack: writing into the buffer
-    // that the device is about to play.
-    return 11'000'000;
+    // One full device buffer (periods x period, 20 ms with the 10 ms / 2 period setup) plus a
+    // couple of milliseconds of slack: a click written into the buffer must land in audio the
+    // device has not started playing yet.
+    return m_minLeadNs.load(std::memory_order_relaxed);
 }
 
 int64_t MicEngine::overrideNs() const {
@@ -835,6 +872,17 @@ void MicEngine::publish() {
     next.droppedClicks = static_cast<int>(m_statDropped);
     next.unmatched = static_cast<int>(m_statUnmatched);
     next.queueDepth = static_cast<int>(m_clickQueue.size());
+    next.monitorUnderruns = static_cast<int>(m_monitorJitter.underruns());
+    next.monitorTrims = static_cast<int>(m_monitorJitter.trims());
+    {
+        uint32_t rate = m_renderSampleRate.load(std::memory_order_relaxed);
+        if (rate == 0) {
+            rate = static_cast<uint32_t>(kSampleRate);
+        }
+        next.monitorFillMs = static_cast<int>(m_monitorJitter.fillFrames() * 1000 / rate);
+        next.renderSampleRate = static_cast<int>(rate);
+        next.renderPeriodFrames = static_cast<int>(m_renderPeriodFrames.load(std::memory_order_relaxed));
+    }
     {
         std::lock_guard<std::mutex> guard(m_fingerprintMutex);
         next.calibrated = m_fingerprint.valid;
