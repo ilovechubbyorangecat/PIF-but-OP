@@ -13,17 +13,22 @@
 //   * slices can be cut out of the rolling ring buffer,
 //   * rhythm lock recovers an injected latency and its drift,
 //   * the capture -> monitor jitter buffer pre-rolls, never replays stale audio on an underrun
-//     and trims itself back when two device clocks drift apart.
+//     and trims itself back when two device clocks drift apart,
+//   * click slices keep ~45 ms after the peak, are gated with a smooth envelope (no chop) and
+//     always end on silence,
+//   * eight overlapping ClickVoices mix without clipping, steal the oldest and never allocate.
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <new>
 #include <random>
 #include <vector>
 
 #include "AudioRing.hpp"
+#include "ClickMixer.hpp"
 #include "Dsp.hpp"
 #include "JitterBuffer.hpp"
 #include "Fingerprint.hpp"
@@ -32,6 +37,45 @@
 #include "TransientDetector.hpp"
 
 using namespace micclicks;
+
+// Counts heap traffic while `g_trackAllocations` is on (see the click mixer test).
+bool g_trackAllocations = false;
+size_t g_allocationCount = 0;
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
+
+void* operator new(size_t size) {
+    if (g_trackAllocations) {
+        ++g_allocationCount;
+    }
+    void* memory = std::malloc(size ? size : 1);
+    if (!memory) {
+        throw std::bad_alloc();
+    }
+    return memory;
+}
+void* operator new[](size_t size) {
+    return ::operator new(size);
+}
+void operator delete(void* memory) noexcept {
+    std::free(memory);
+}
+void operator delete[](void* memory) noexcept {
+    std::free(memory);
+}
+void operator delete(void* memory, size_t) noexcept {
+    std::free(memory);
+}
+void operator delete[](void* memory, size_t) noexcept {
+    std::free(memory);
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 namespace {
 
@@ -113,6 +157,13 @@ double timeOfFrame(uint64_t frame) {
 bool near(double a, double b, double tolerance) {
     return std::abs(a - b) <= tolerance;
 }
+
+size_t msFrames(float ms) {
+    return static_cast<size_t>(ms * 0.001f * static_cast<float>(kSampleRate) + 0.5f);
+}
+
+// Allocation tracking for the real-time safety check (globals are defined above, next to the
+// operator new that counts them).
 
 } // namespace
 
@@ -463,6 +514,130 @@ int main() {
         }
         check(accepted < 200 * block && jitter.overflows() > 0, "a stopped output drops audio instead of overrunning");
         check(jitter.fillFrames() <= jitter.capacityFrames(), "the jitter buffer never exceeds its capacity");
+    }
+
+    // ---- click slicing: tail length, smooth gate, silence at the end -------------------
+    {
+        int const rate = kSampleRate;
+        size_t const preRoll = msFrames(12.f);
+        size_t const tail = msFrames(60.f);
+        size_t const frames = preRoll + tail;
+        std::vector<float> raw(frames, 0.f);
+        std::mt19937 sliceRng(777);
+        std::uniform_real_distribution<float> noise(-0.0006f, 0.0006f);
+        for (auto& sample : raw) {
+            sample = noise(sliceRng);  // room tone, about -64 dBFS
+        }
+        // A click: 0.9 ms attack, 6 ms exponential decay, at the end of the pre-roll.
+        size_t clickStart = preRoll;
+        for (size_t i = 0; i < msFrames(8.f); ++i) {
+            float t = static_cast<float>(i) / static_cast<float>(rate);
+            float attack = std::min(1.f, t / 0.0009f);
+            raw[clickStart + i] += 0.12f * attack * std::exp(-t / 0.006f);
+        }
+
+        std::vector<float> groomed = raw;
+        SliceShape shape = groomClickSlice(groomed.data(), groomed.size(), rate);
+        double tailMs = shape.length > shape.peakOffset ? static_cast<double>(shape.length - shape.peakOffset) * 1000.0 / rate : 0.0;
+        std::printf("\nslice: %zu frames, peak at %zu, %.1f ms of tail\n", shape.length, shape.peakOffset, tailMs);
+        check(shape.length > 0 && tailMs >= 35.0 && tailMs <= 50.0, "a slice keeps 35-50 ms of click after the peak");
+        check(std::abs(groomed[shape.length - 1]) < 1e-6f, "a slice ends on exact silence");
+
+        float preRms = 0.f;
+        for (size_t i = 0; i < msFrames(5.f) && i < shape.length; ++i) {
+            preRms += groomed[i] * groomed[i];
+        }
+        preRms = std::sqrt(preRms / static_cast<float>(msFrames(5.f)));
+        check(preRms < 0.001f, "the room tone before the click is gated away");
+
+        // No hard edge in the tail: the biggest sample-to-sample step in the last 20 ms has to
+        // stay tiny, which is what "smooth release" means in practice.
+        size_t from = shape.length > msFrames(20.f) ? shape.length - msFrames(20.f) : 0;
+        float biggestStep = 0.f;
+        for (size_t i = from + 1; i < shape.length; ++i) {
+            biggestStep = std::max(biggestStep, std::abs(groomed[i] - groomed[i - 1]));
+        }
+        check(biggestStep < 0.01f, "the gate release fades out instead of chopping");
+
+        float attackPeak = 0.f;
+        size_t attackPeakAt = 0;
+        for (size_t i = 0; i < shape.length; ++i) {
+            if (std::abs(groomed[i]) > attackPeak) {
+                attackPeak = std::abs(groomed[i]);
+                attackPeakAt = i;
+            }
+        }
+        check(near(attackPeak, 0.5, 0.03), "the slice is normalised to a consistent level");
+        check(attackPeakAt + 2 > shape.peakOffset && attackPeakAt < shape.peakOffset + 60,
+            "the gate opens before the transient, so the attack is untouched");
+
+        // A very quiet click may be lifted, but only by the bounded gain: never amplify hiss.
+        std::vector<float> whisper = raw;
+        for (auto& sample : whisper) {
+            sample *= 0.03f;  // the click is now ~-50 dBFS
+        }
+        SliceShape quietShape = groomClickSlice(whisper.data(), whisper.size(), rate);
+        float quietPeak = 0.f;
+        for (size_t i = 0; i < quietShape.length; ++i) {
+            quietPeak = std::max(quietPeak, std::abs(whisper[i]));
+        }
+        check(quietShape.length > 0 && quietPeak <= 0.12f * 8.f * 0.5f + 0.01f, "quiet clicks are lifted, but the gain is bounded");
+    }
+
+    // ---- click mixer: eight voices, stealing, soft limiting, no allocation -------------
+    {
+        ClickMixer mixer;
+        mixer.reset();
+        std::vector<float> click(msFrames(45.f));
+        for (size_t i = 0; i < click.size(); ++i) {
+            click[i] = 0.05f * std::sin(static_cast<float>(i) * 0.3f);
+        }
+        std::vector<float> block(480 * 2, 0.f);
+
+        // Eight simultaneous voices must all be audible: the mix is eight times one voice
+        // (0.05 * 8 = 0.4, still below the limiter knee).
+        for (int i = 0; i < 8; ++i) {
+            mixer.start(click.data(), static_cast<uint32_t>(click.size()), 0, 1.f);
+        }
+        check(mixer.activeVoices() == 8, "all eight click voices are used");
+        mixer.mix(block.data(), 480, 0);
+        float peak = 0.f;
+        for (float value : block) {
+            peak = std::max(peak, std::abs(value));
+        }
+        check(peak > 0.35f && peak < 0.42f, "eight overlapping clicks are summed, not dropped");
+
+        // A ninth click steals the oldest voice instead of being ignored.
+        uint32_t stealsBefore = mixer.stolenVoices();
+        mixer.start(click.data(), static_cast<uint32_t>(click.size()), 0, 1.f);
+        check(mixer.stolenVoices() > stealsBefore, "the oldest voice is stolen when all eight are busy");
+
+        // Soft limiter: transparent below the knee, bounded above it.
+        std::vector<float> loud { 0.5f, -0.69f, 2.f, -6.f, 0.7f };
+        ClickMixer::softLimit(loud.data(), loud.size() / 2);
+        check(std::abs(loud[0] - 0.5f) < 1e-6f && std::abs(loud[1] + 0.69f) < 1e-6f, "the limiter leaves normal levels alone");
+        bool bounded = true;
+        for (float value : loud) {
+            bounded = bounded && std::abs(value) <= 1.f;
+        }
+        check(bounded, "overlapping peaks are limited below full scale");
+
+        // Real-time safety: starting and mixing voices must not touch the heap.
+        ClickMixer rtMixer;
+        rtMixer.reset();
+        std::vector<float> rtBlock(480 * 2, 0.f);
+        rtMixer.start(click.data(), static_cast<uint32_t>(click.size()), 0, 1.f);
+        size_t allocations = 0;
+        g_trackAllocations = true;
+        g_allocationCount = 0;
+        for (int i = 0; i < 64; ++i) {
+            rtMixer.start(click.data(), static_cast<uint32_t>(click.size()), static_cast<uint64_t>(i * 120), 1.f);
+            rtMixer.mix(rtBlock.data(), 480, static_cast<uint64_t>(i * 480));
+            ClickMixer::softLimit(rtBlock.data(), 480);
+        }
+        allocations = g_allocationCount;
+        g_trackAllocations = false;
+        check(allocations == 0, "the audio path allocates nothing");
     }
 
     std::printf("\n%s (%d failure%s)\n", failures == 0 ? "PASS" : "FAILED", failures, failures == 1 ? "" : "s");

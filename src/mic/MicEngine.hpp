@@ -24,7 +24,9 @@
 
 #include "AudioBackend.hpp"
 #include "AudioRing.hpp"
+#include "ClickMixer.hpp"
 #include "Dsp.hpp"
+#include "Envelope.hpp"
 #include "Fingerprint.hpp"
 #include "JitterBuffer.hpp"
 #include "RhythmLock.hpp"
@@ -39,6 +41,11 @@ namespace micclicks {
 inline constexpr int kMonitorPreRollMs = 12;
 inline constexpr int kMonitorMaxLagMs = 40;
 inline constexpr int kMonitorCapacityMs = 300;
+// Smooth open/close for the monitored stream: no chop when it starts, stops or runs dry.
+inline constexpr float kMonitorGateAttackMs = 8.f;
+inline constexpr float kMonitorGateReleaseMs = 30.f;
+// Frames mixed per inner chunk in the render callback (fixed, so nothing is allocated).
+inline constexpr size_t kMixChunkFrames = 512;
 
 enum class MonitorMode : int {
     ClicksOnly = 0,
@@ -62,7 +69,7 @@ struct EngineConfig {
     int monitorMode = 0;
     int alignMode = 0;
     float preRollMs = 12.f;
-    float tailMs = 150.f;
+    float tailMs = 45.f;  // ~35-50 ms of click after the transient peak
 };
 
 struct EngineStatus {
@@ -99,6 +106,8 @@ struct EngineStatus {
     // monitoring (jitter buffer) health and the negotiated render format
     int monitorUnderruns = 0;
     int monitorTrims = 0;
+    int voices = 0;       // click voices playing in the last render block
+    int voiceSteals = 0;  // how often a voice had to be stolen (all 8 busy)
     int monitorFillMs = 0;
     int renderSampleRate = 0;
     int renderPeriodFrames = 0;
@@ -152,7 +161,6 @@ private:
         uint64_t startFrame = 0;
         uint32_t length = 0;
         uint32_t onsetOffset = 0;
-        float gain = 1.f;
         std::array<float, kMaxSliceFrames> samples {};
     };
 
@@ -240,8 +248,10 @@ private:
     AudioRing m_ring;
     SpscQueue<ClickSlice, 8> m_clickQueue;
     JitterBuffer m_monitorJitter;
-    std::array<float, 2048> m_monitorScratch {};
+    std::array<float, kMixChunkFrames> m_monitorScratch {};
+    std::array<float, kMixChunkFrames * 2> m_mixScratch {};
     std::atomic<bool> m_monitorReset { false };
+    GateEnvelope m_monitorGate;
     SpscQueue<InputMessage, 256> m_inputQueue;
     SpscQueue<DeliveryMessage, 256> m_deliveryQueue;
     std::atomic<uint32_t> m_inputOverflow { 0 };
@@ -267,8 +277,11 @@ private:
     std::atomic<uint32_t> m_renderPeriods { 0 };
     std::atomic<int64_t> m_renderTimeNs { 0 };
     std::atomic<float> m_capturePeakDb { -120.f };
-    ClickSlice m_active[6];
-    size_t m_activeCount = 0;
+    ClickMixer m_clickMixer;
+    ClickSlice m_popScratch;    // one queue slot, reused so the callback never allocates
+    ClickSlice m_sliceMessage;  // the worker's outgoing slice (heap-free, 16 KB)
+    std::atomic<int> m_voiceCount { 0 };
+    std::atomic<int> m_voiceSteals { 0 };
 
     // calibration
     std::atomic<int> m_calibrationRequest { 0 };

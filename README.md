@@ -45,6 +45,19 @@ the buffer holds the input back.
 **No main-thread work.** FFT, detection, slicing, mixing and device I/O all happen off-thread behind
 lock-free single-producer/single-consumer queues; the game hooks only push a timestamp.
 
+**Click slices.** A detected click is cut with ~12 ms of pre-roll and ~45 ms of tail after the
+transient peak, normalised (up to +18 dB, so soft clicks sound like hard ones and hiss is never
+amplified) and then *gated with a smoothed envelope*: the room tone before the click is ducked, the
+click itself is untouched (the gate opens ~2 ms early, so the attack survives), and the room tone
+after it fades out over 30 ms instead of being chopped off at a window boundary. Every slice ends on
+exact silence, which is what makes "Clicks Only" monitoring pass no static between clicks.
+
+**Eight voices, soft limited.** Quick tapping overlaps clicks, so the mixer has eight `ClickVoice`
+slots: every slice is copied into a free slot the moment it starts, and when all eight are busy the
+*oldest* one is stolen (by then it is the quietest). The sum then goes through a tanh soft-knee
+limiter - transparent below 0.7, asymptotic to full scale above it - so a burst of clicks compresses
+smoothly instead of clipping or cutting the last tap off.
+
 **No crackle.** All three device paths (microphone, monitoring, click output) are opened at 48 kHz
 float in WASAPI *shared* mode - never exclusive, so Windows does not fight VB-Cable or OBS for the
 device - with 10 ms periods and two periods per buffer (20 ms). Tiny 1-5 ms periods are what makes
@@ -53,7 +66,9 @@ monitoring path runs through a jitter buffer with a 12 ms pre-roll: the micropho
 device have independent clocks, so the pre-roll absorbs the drift, an underrun plays silence (never a
 repeat of audio already played, which is what a crackle actually is), and once more than 40 ms is
 queued the oldest frames are trimmed so the monitoring latency never creeps up. The panel's status
-line shows the negotiated `kHz / ms`, and its stats line shows `jit <ms> u<underruns> t<trims>`.
+line shows the negotiated `kHz / ms`, and its stats line shows the click voices (`v<active>/8
+s<steals>`) and the jitter buffer (`jit <ms> u<underruns> t<trims>`). A monitor start, stop or
+underrun is faded in/out over 8 ms / 30 ms by a gate envelope instead of switching abruptly.
 
 | setting | default | what it does |
 | --- | --- | --- |
