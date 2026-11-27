@@ -6,7 +6,7 @@
 		"mac": "2.2091",
 		"ios": "2.2091"
 	},
-	"version": "v3.2.0",
+	"version": "v3.3.0",
 	"id": "basu.input-buffer",
 	"name": "Click Before Frames",
 	"developer": "BASU",
@@ -454,6 +454,82 @@
 				"Dark"
 			]
 		},
+		"mic-clicks": {
+			"type": "bool",
+			"name": "Mic Clicks: play your real clicks",
+			"description": "Plays your actual mouse clicks: the microphone hears them, the mod matches the click's attack to the tick the game registered the input on, and the slice is played back aligned. Open the Mic Setup panel (F12, or Tools > Mic Setup in the mod menu) to pick devices, calibrate and hear yourself.",
+			"default": false
+		},
+		"mic-device": {
+			"type": "string",
+			"name": "Mic Clicks: microphone",
+			"description": "Input device to listen to. Pick it in the Mic Setup panel (names change with the hardware, so it is stored by name). 'System default' follows the OS.",
+			"default": "System default"
+		},
+		"mic-output": {
+			"type": "string",
+			"name": "Mic Clicks: click output",
+			"description": "Where the processed, tick-aligned clicks go. Choose a virtual cable (VB-Cable, VoiceMeeter, BlackHole) to send them to OBS or Discord on their own, separate from the game audio.",
+			"default": "System default"
+		},
+		"mic-monitor": {
+			"type": "bool",
+			"name": "Mic Clicks: hear yourself",
+			"description": "Sidetone. With headphones on you hear what the mod hears; use 'Clicks Only' for just the detected clicks or 'Everything' for the raw feed.",
+			"default": false
+		},
+		"mic-monitor-mode": {
+			"type": "string",
+			"name": "Mic Clicks: hear yourself mode",
+			"description": "Clicks Only: only the gated click slices. Everything: the full raw microphone feed.",
+			"default": "Clicks Only",
+			"one-of": [ "Clicks Only", "Everything" ]
+		},
+		"mic-monitor-gain": {
+			"type": "float",
+			"name": "Mic Clicks: monitor level",
+			"description": "Volume of the raw microphone feed in 'Everything' mode.",
+			"default": 0.8,
+			"min": 0.0,
+			"max": 2.0
+		},
+		"mic-click-gain": {
+			"type": "float",
+			"name": "Mic Clicks: click level",
+			"description": "Volume of the processed click slices that are sent to the output device.",
+			"default": 1.0,
+			"min": 0.0,
+			"max": 2.0
+		},
+		"mic-sensitivity": {
+			"type": "float",
+			"name": "Mic Clicks: sensitivity",
+			"description": "Scales the gate above the learned noise floor. Higher catches softer clicks (closer to the microphone) but can let more room noise through.",
+			"default": 1.0,
+			"min": 0.4,
+			"max": 2.5
+		},
+		"mic-delay-offset": {
+			"type": "float",
+			"name": "Mic Clicks: delay fine tune (ms)",
+			"description": "Added to the automatically measured microphone delay. Use it if the clicks still sound a little late (negative) or early (positive) next to the game.",
+			"default": 0.0,
+			"min": -60.0,
+			"max": 60.0
+		},
+		"mic-align-mode": {
+			"type": "string",
+			"name": "Mic Clicks: click alignment",
+			"description": "Game tick: the click plays on the tick the game finally registers the input (after the buffer's delay), so sound and jump match. Physical click: the click plays where you pressed, even if the buffer holds the input back.",
+			"default": "Game tick",
+			"one-of": [ "Game tick", "Physical click" ]
+		},
+		"mic-snap-tick": {
+			"type": "bool",
+			"name": "Mic Clicks: snap to the physics tick",
+			"description": "Rounds every input timestamp to the tick grid (240 Hz by default) before pairing it with the mic click, so one click can never straddle two ticks.",
+			"default": true
+		},
 		"bind-stage": {
 			"type": "keybind",
 			"name": "Key: change stage",
@@ -506,6 +582,15 @@
 			"category": "gameplay",
 			"default": [
 				"F11"
+			]
+		},
+		"bind-mic": {
+			"type": "keybind",
+			"name": "Key: Mic Setup panel",
+			"description": "Opens the Mic Setup panel (devices, calibration, delay, hear yourself, output routing).",
+			"category": "gameplay",
+			"default": [
+				"F12"
 			]
 		},
 		"tps": {

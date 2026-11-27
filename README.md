@@ -1,7 +1,7 @@
 # Click Before Frames (Geode)
 
 ## Keys
-6 cycle stage | 7 menu | F8 copy the console log | F9 open/close the in-game console | F10 path view | F11 forget this level's memory
+6 cycle stage | 7 menu | F8 copy the console log | F9 open/close the in-game console | F10 path view | F11 forget this level's memory | F12 Mic Clicks setup
 
 Requires Geode 6.0.0 or newer (the first Geode release with stable Geometry Dash 2.2091 support).
 
@@ -10,6 +10,58 @@ Practice use only; do not use for verified or leaderboard runs.
 Select **16f** on the Stage page for a buffer window of up to 16 frames at 60 FPS (64 physics ticks at 240 TPS). Low Latency still caps presets at one frame, and ship uses its own delay setting. For independent limits, choose **Custom → Open Tuning** and set each mode in half-frame steps up to 16 frames.
 
 This mod no longer checks for or installs updates in-game. Install new versions manually.
+
+## Mic Clicks (v3.3)
+
+Plays your real clicks instead of a synthesized one: the mod listens to your microphone, learns the
+fingerprint of your mouse click, detects the attack in real time and plays that slice back aligned to
+the physics tick the game registers the input on.
+
+**Setup.** Press F12 (or Buffer menu → Stage → *Mic Setup*). Pick your microphone, hit **Calibrate**
+and click the mouse 8-10 times when asked. The panel shows a level meter with the learned noise floor,
+a confidence score and the measured delay. **Hear Yourself** is the sidetone: *Clicks Only* plays just
+what the detector accepted, *Everything* passes the raw feed through. Pick VB-Cable, VoiceMeeter or
+BlackHole as the click output to give OBS/Discord the clicks on their own channel, separate from the
+game audio. The delay can be trimmed by ±60 ms on top of the measured value.
+
+**Fingerprint.** 16-band spectral shape, attack slope, decay time, brightness (spectral centroid) and
+flux, all measured against the room's noise floor. It is saved to the mod's config folder as
+`mic-clicks-fingerprint.json`, so calibration is a one-time thing.
+
+**Detection.** A dedicated audio thread keeps the last seconds of raw microphone audio in a ring buffer
+and runs the transient detector over overlapping FFT hops. The analysed window is delayed by half a
+window, so a click lands in the middle of the Hann window instead of on its taper (worth ~12 dB SNR on
+soft clicks). Clicks must match the fingerprint's band energy, brightness and attack; rolling voice
+suppression keeps talking out. In the host test the fingerprint finds 10/10 soft clicks and 10/10 loud
+ones, while a plain +18 dB amplitude gate misses every soft click and lets voice through.
+
+**Rhythm lock.** Every physical press is paired with the tick the game finally receives it on, and
+both are matched to the nearest microphone transient. The last 40 pairs feed a trimmed mean/median that
+learns the delay, watches jitter and drift, and the slice is scheduled so its attack peak sits exactly
+on the input tick. *Game tick* alignment plays the click where the game registers the input (after the
+buffer's delay, so sound and jump match); *Physical click* plays it where you really pressed, even when
+the buffer holds the input back.
+
+**No main-thread work.** FFT, detection, slicing, mixing and device I/O all happen off-thread behind
+lock-free single-producer/single-consumer queues; the game hooks only push a timestamp.
+
+| setting | default | what it does |
+| --- | --- | --- |
+| Mic Clicks: play your real clicks | off | master switch |
+| microphone | System default | input device, chosen in the panel |
+| click output | System default | where the processed clicks go (VB-Cable for OBS/Discord) |
+| hear yourself | off | sidetone on the same output device |
+| hear yourself mode | Clicks Only | Clicks Only / Everything (raw feed) |
+| monitor level | 0.8 | volume of the raw feed in Everything mode |
+| click level | 1.0 | volume of the processed clicks |
+| sensitivity | 1.0 | scales the gate above the learned noise floor |
+| delay fine tune (ms) | 0 | added to the measured microphone delay |
+| click alignment | Game tick | Game tick / Physical click |
+| snap to the physics tick | on | rounds input timestamps to the physics grid before pairing |
+
+The DSP is plain C++ with no Geode or cocos dependency, so it can be checked without the game:
+`g++ -std=c++20 -O2 -Isrc/mic tests/mic_dsp_test.cpp src/mic/Fft.cpp src/mic/Fingerprint.cpp src/mic/TransientDetector.cpp src/mic/RhythmLock.cpp src/mic/Slicer.cpp -o build/mic_dsp_test && ./build/mic_dsp_test`
+(the test synthesizes clicks, voice and keyboard noise, so no audio device is needed).
 
 ## v3.0
 - **Autoplay** (for showcases, test mode: nothing is saved as progress and AUTOPLAY stays on screen): plans a route up to 10 s ahead while it plays, a pathfinder for wave and ship, and it learns from its deaths.

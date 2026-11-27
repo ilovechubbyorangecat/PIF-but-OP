@@ -34,6 +34,8 @@
 #include <map>
 #include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/RingObject.hpp>
+
+#include "mic/MicClicks.hpp"
 #ifdef GEODE_IS_WINDOWS
 #include <Windows.h>
 #endif
@@ -11554,7 +11556,9 @@ private:
         float r1 = qTop - 20.f - inner * 0.3f;
         float r2 = qBottom + inner * 0.28f;
         float qb = (colW - 22.f) / 2.f;
-        button(m_pageMenu, "Run Check", menu_selector(BufferMenu::onRunCheck), { x + colW / 2.f, r1 }, colW - 16.f, true);
+        float qbw = (colW - 22.f) / 2.f;
+        button(m_pageMenu, "Run Check", menu_selector(BufferMenu::onRunCheck), { x + 8.f + qbw / 2.f, r1 }, qbw, true);
+        button(m_pageMenu, "Mic Setup", menu_selector(BufferMenu::onMicSetup), { x + 14.f + qbw * 1.5f, r1 }, qbw);
         button(m_pageMenu, "Changelog", menu_selector(BufferMenu::onChangelog), { x + 8.f + qb / 2.f, r2 }, qb);
         button(m_pageMenu, "Statistics", menu_selector(BufferMenu::onStats), { x + 14.f + qb * 1.5f, r2 }, qb);
         // custom (right)
@@ -12442,6 +12446,10 @@ private:
             "OK")->show();
     }
 
+    void onMicSetup(CCObject*) {
+        micclicks::openSetup();
+    }
+
     void onStats(CCObject*) {
         FLAlertLayer::create("Statistics", statsText(), "OK")->show();
     }
@@ -12592,6 +12600,8 @@ $on_mod(Loaded) {
     CBF_STEP("loaded: settings read, applying stage");
     readSettings();
     applyStage();
+    // v3.3: Mic Clicks (real clicks from the mic, aligned to the physics tick)
+    micclicks::init();
     CBF_STEP("loaded: stage applied");
 #ifdef GEODE_IS_WINDOWS
     if (buf.console) {
@@ -12946,6 +12956,7 @@ class $modify(BufPlayLayer, PlayLayer) {
     }
 
     void onQuit() {
+        micclicks::onLevelEnd();
         benchFinish();
         benchFlush();
         benchRecording = false;
@@ -12994,6 +13005,7 @@ class $modify(BufPlayLayer, PlayLayer) {
         benchFinish();
         benchNeedStart = true;
         endAttempt();
+        micclicks::onLevelStart();
         buf.usedThisAttempt = false;
         // v2.84: same on a restart (R, checkpoints, practice): never start an attempt with the
         // game holding a button you already let go of
@@ -13196,6 +13208,7 @@ class $modify(BufPlayerObject, PlayerObject) {
         auto* layer = GameManager::get()->m_playLayer;
         if (layer && this == layer->m_player1) {
             ++tickCount;
+            micclicks::onGameTick(tickCount, dt);
             if (!triggerChecks.empty()) {
                 runTriggerChecks(layer);  // v2.84
             }
@@ -13419,12 +13432,15 @@ namespace {
                 saveMemory();
                 say("memory for this level cleared");
                 break;
+            case 6:
+                micclicks::openSetup();
+                break;
         }
     }
 
     void setupKeybinds() {
-        char const* binds[] = { "bind-stage", "bind-menu", "bind-export", "bind-console", "bind-path", "bind-forget" };
-        for (int i = 0; i < 6; ++i) {
+        char const* binds[] = { "bind-stage", "bind-menu", "bind-export", "bind-console", "bind-path", "bind-forget", "bind-mic" };
+        for (int i = 0; i < 7; ++i) {
             listenForKeybindSettingPresses(binds[i], [i](Keybind const&, bool down, bool repeat, double) {
                 if (down && !repeat) {
                     keyAction(i);
@@ -13800,6 +13816,10 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                 finishDrift("");
             }
             recordRealInput(down, p1);
+            // the player's own press/release: pairs with the mic click for the latency estimate
+            if (!autoplay.active) {
+                micclicks::onUserInput(down);
+            }
         }
         if (!buf.simulating && button == 1 && !buf.injecting) {
             // v2.21 performance log: what this click cost, measured around the whole decision.
@@ -13819,6 +13839,8 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         }
         if (!buf.simulating && button == 1) {
             benchInput(down);  // v2.75: what the game really gets (your clicks and delayed ones)
+            // v3.3: the tick this input is registered on (after the buffer, if it held it back)
+            micclicks::onDeliveredInput(down);
         }
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
